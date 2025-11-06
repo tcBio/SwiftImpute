@@ -1,0 +1,87 @@
+# Build directories
+build/
+.vs/
+.vscode/
+
+# Documentation folder (keep only README.md and GETTING_STARTED.md in root)
+docs/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!CMakeLists.txt
+
+# Visual Studio
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sdf
+*.opensdf
+*.db
+*.opendb
+*.ipch
+*.aps
+*.ncb
+*.obj
+*.pdb
+*.ilk
+*.log
+*.tlog
+*.lastbuildstate
+*.idb
+*.pch
+
+# CUDA compiled files
+*.ptx
+*.cubin
+*.fatbin
+*.cudafe*
+*.o
+*.i
+*.ii
+
+# Executables
+*.exe
+*.out
+*.app
+*.lib
+*.dll
+*.so
+*.dylib
+
+# Test data (exclude large VCF files)
+*.vcf.gz
+*.vcf.gz.tbi
+*.bcf
+*.bcf.csi
+data/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Python (if using Python bindings later)
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+venv/
+env/
+
+# Temporary files
+*.tmp
+*.bak
+*.swn
+tmp/

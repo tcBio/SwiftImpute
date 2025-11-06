@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(pwsh:*)",
+      "Bash(cmake --version:*)",
+      "Bash(nvcc:*)",
+      "Bash(cmd.exe /c \"powershell -ExecutionPolicy Bypass -File build.ps1\")",
+      "Bash(powershell.exe -ExecutionPolicy Bypass -File build.ps1)",
+      "Bash(powershell.exe:*)",
+      "Bash(git init:*)",
+      "Bash(git config:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
