@@ -261,29 +261,3 @@ Based on:
 - Prophaser GPU checkpointing strategy
 
 Funded by True Cultivar Bioscience.
-
-## Roadmap
-
-### Phase 1 (Current)
-- Basic Li-Stephens HMM on GPU
-- PBWT state selection
-- VCF I/O
-- Single GPU support
-
-### Phase 2 (Q2 2025)
-- Multi-GPU support
-- Bref3 format support
-- Rare variant optimization
-- Python bindings
-
-### Phase 3 (Q3 2025)
-- X chromosome handling
-- Trio-aware constraints
-- Cloud deployment
-- Web interface
-
-### Phase 4 (Q4 2025)
-- Polyploid support (cannabis diploid first)
-- Ancient DNA mode
-- Structural variant imputation
-- Integration with genomic prediction tools
