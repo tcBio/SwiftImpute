@@ -40,7 +40,8 @@ constexpr prob_t LOG_ONE = 0.0f;
  */
 __global__ void forward_pass_kernel(
     const prob_t* __restrict__ emission_probs,
-    const prob_t* __restrict__ transition_matrices,
+    const prob_t* __restrict__ transition_matrix,
+    const marker_t* __restrict__ selected_states,
     uint32_t num_markers,
     uint32_t num_states,
     uint32_t checkpoint_interval,
@@ -99,14 +100,12 @@ __global__ void forward_pass_kernel(
         if (tid < num_states) {
             uint32_t to_state = tid;
 
-            // Get transition matrix for this marker
-            uint64_t trans_offset = static_cast<uint64_t>(m - 1) * num_states * num_states;
-
+            // Use single transition matrix (state-independent transitions)
             // Compute Σ_i α(m-1, i) * transition(i, to_state)
             prob_t sum = LOG_ZERO;
 
             for (uint32_t from_state = 0; from_state < num_states; ++from_state) {
-                prob_t trans_prob = transition_matrices[trans_offset + from_state * num_states + to_state];
+                prob_t trans_prob = transition_matrix[from_state * num_states + to_state];
                 prob_t val = alpha_prev[from_state] + trans_prob;
                 sum = logsumexp2(sum, val);
             }
@@ -156,7 +155,8 @@ __global__ void forward_pass_kernel(
  */
 __global__ void backward_pass_kernel(
     const prob_t* __restrict__ emission_probs,
-    const prob_t* __restrict__ transition_matrices,
+    const prob_t* __restrict__ transition_matrix,
+    const marker_t* __restrict__ selected_states,
     const prob_t* __restrict__ forward_checkpoints,
     const prob_t* __restrict__ scaling_factors,
     uint32_t num_markers,
@@ -195,11 +195,10 @@ __global__ void backward_pass_kernel(
         // Similar to forward pass, but only updating alpha_recomp
         if (tid < num_states) {
             uint32_t to_state = tid;
-            uint64_t trans_offset = static_cast<uint64_t>(m - 1) * num_states * num_states;
 
             prob_t sum = LOG_ZERO;
             for (uint32_t from_state = 0; from_state < num_states; ++from_state) {
-                prob_t trans_prob = transition_matrices[trans_offset + from_state * num_states + to_state];
+                prob_t trans_prob = transition_matrix[from_state * num_states + to_state];
                 prob_t val = alpha_recomp[from_state] + trans_prob;
                 sum = logsumexp2(sum, val);
             }
@@ -229,11 +228,10 @@ __global__ void backward_pass_kernel(
         // Compute β(m, from_state)
         if (tid < num_states) {
             uint32_t from_state = tid;
-            uint64_t trans_offset = static_cast<uint64_t>(m) * num_states * num_states;
 
             prob_t sum = LOG_ZERO;
             for (uint32_t to_state = 0; to_state < num_states; ++to_state) {
-                prob_t trans_prob = transition_matrices[trans_offset + from_state * num_states + to_state];
+                prob_t trans_prob = transition_matrix[from_state * num_states + to_state];
                 uint64_t emission_idx = emission_base + (m + 1) * num_states + to_state;
                 prob_t val = trans_prob + emission_probs[emission_idx] + beta_prev[to_state];
                 sum = logsumexp2(sum, val);
@@ -265,11 +263,10 @@ __global__ void backward_pass_kernel(
             for (marker_t mm = checkpoint_m + 1; mm <= m; ++mm) {
                 if (tid < num_states) {
                     uint32_t to_state = tid;
-                    uint64_t trans_offset = static_cast<uint64_t>(mm - 1) * num_states * num_states;
 
                     prob_t sum = LOG_ZERO;
                     for (uint32_t from_state = 0; from_state < num_states; ++from_state) {
-                        prob_t trans_prob = transition_matrices[trans_offset + from_state * num_states + to_state];
+                        prob_t trans_prob = transition_matrix[from_state * num_states + to_state];
                         prob_t val = alpha_recomp[from_state] + trans_prob;
                         sum = logsumexp2(sum, val);
                     }
@@ -323,7 +320,8 @@ __global__ void backward_pass_kernel(
 
 void launch_forward_pass(
     const prob_t* d_emission_probs,
-    const prob_t* d_transition_matrices,
+    const prob_t* d_transition_matrix,
+    const marker_t* d_selected_states,
     uint32_t num_samples,
     uint32_t num_markers,
     uint32_t num_states,
@@ -343,7 +341,8 @@ void launch_forward_pass(
 
     forward_pass_kernel<<<grid, block, shared_mem, stream>>>(
         d_emission_probs,
-        d_transition_matrices,
+        d_transition_matrix,
+        d_selected_states,
         num_markers,
         num_states,
         checkpoint_interval,
@@ -356,7 +355,8 @@ void launch_forward_pass(
 
 void launch_backward_pass(
     const prob_t* d_emission_probs,
-    const prob_t* d_transition_matrices,
+    const prob_t* d_transition_matrix,
+    const marker_t* d_selected_states,
     const prob_t* d_forward_checkpoints,
     const prob_t* d_scaling_factors,
     uint32_t num_samples,
@@ -374,7 +374,8 @@ void launch_backward_pass(
 
     backward_pass_kernel<<<grid, block, shared_mem, stream>>>(
         d_emission_probs,
-        d_transition_matrices,
+        d_transition_matrix,
+        d_selected_states,
         d_forward_checkpoints,
         d_scaling_factors,
         num_markers,

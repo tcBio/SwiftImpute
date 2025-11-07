@@ -1,9 +1,13 @@
 #include "imputer.hpp"
 #include "../io/vcf_reader.hpp"
 #include "../io/vcf_writer.hpp"
+#include "../kernels/emission.hpp"
+#include "../kernels/transition.hpp"
+#include "../kernels/sampling.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <cuda_runtime.h>
 
 namespace swiftimpute {
 
@@ -513,13 +517,39 @@ Imputer::Imputer(
     const ImputationConfig& config
 ) : reference_(reference),
     config_(config),
-    device_id_(-1)
+    emission_computer_(nullptr),
+    transition_computer_(nullptr),
+    haplotype_sampler_(nullptr),
+    d_genotype_liks_(nullptr),
+    d_selected_states_(nullptr),
+    d_emission_probs_(nullptr),
+    d_posterior_probs_(nullptr),
+    d_forward_checkpoints_(nullptr),
+    d_scaling_factors_(nullptr),
+    d_output_haplotypes_(nullptr),
+    h_pinned_genotype_liks_(nullptr),
+    h_pinned_selected_states_(nullptr),
+    h_pinned_output_haplotypes_(nullptr),
+    current_batch_size_(0),
+    gpu_kernels_initialized_(false),
+    using_pinned_memory_(config.use_pinned_memory),
+    device_id_(-1),
+    stream_(0)
 {
     initialize_gpu();
+
+    // Create CUDA stream for async operations
+    if (using_pinned_memory_) {
+        CHECK_CUDA(cudaStreamCreate(&stream_));
+    }
 }
 
 Imputer::~Imputer() {
-    // Cleanup will be handled by unique_ptr destructors
+    free_batch_memory();
+
+    if (stream_) {
+        cudaStreamDestroy(stream_);
+    }
 }
 
 void Imputer::initialize_gpu() {
@@ -534,8 +564,143 @@ void Imputer::initialize_gpu() {
 
     // Set device
     CHECK_CUDA(cudaSetDevice(device_id_));
+}
 
-    // TODO: Initialize GPU memory pools, streams, etc.
+void Imputer::initialize_gpu_kernels() {
+    if (gpu_kernels_initialized_) {
+        return;
+    }
+
+    LOG_INFO("Initializing GPU kernels...");
+
+    marker_t num_markers = reference_.num_markers();
+    uint32_t num_states = config_.hmm_params.num_states;
+
+    // Initialize emission computer
+    emission_computer_ = std::make_unique<kernels::EmissionComputer>(
+        num_markers,
+        reference_.num_haplotypes(),
+        num_states,
+        device_id_
+    );
+    emission_computer_->set_reference_panel(reference_.haplotypes());
+
+    // Initialize transition computer
+    transition_computer_ = std::make_unique<kernels::TransitionComputer>(
+        num_markers,
+        num_states,
+        device_id_
+    );
+
+    // Set up genetic map
+    std::vector<double> genetic_distances(num_markers);
+    for (marker_t m = 0; m < num_markers; ++m) {
+        if (reference_.markers()[m].cM > 0.0) {
+            genetic_distances[m] = reference_.markers()[m].cM / 100.0;  // Convert to Morgans
+        } else {
+            // Estimate: 1 cM ≈ 1 Mb
+            genetic_distances[m] = static_cast<double>(reference_.markers()[m].pos) / 1e8;
+        }
+    }
+    transition_computer_->set_genetic_map(genetic_distances.data());
+
+    // Set HMM parameters
+    kernels::HMMParameters hmm_params;
+    hmm_params.ne = config_.hmm_params.ne;
+    hmm_params.rho_rate = config_.hmm_params.rho_rate;
+    hmm_params.theta = config_.hmm_params.theta;
+    transition_computer_->set_parameters(hmm_params);
+
+    // Precompute transition matrices
+    LOG_INFO("Precomputing transition matrices...");
+    transition_computer_->compute();
+
+    // Initialize sampler
+    haplotype_sampler_ = std::make_unique<kernels::HaplotypeSampler>(
+        num_markers,
+        reference_.num_haplotypes(),
+        num_states,
+        device_id_
+    );
+    haplotype_sampler_->set_reference_panel(reference_.haplotypes());
+
+    gpu_kernels_initialized_ = true;
+    LOG_INFO("GPU kernel initialization complete");
+}
+
+void Imputer::allocate_batch_memory(uint32_t batch_size) {
+    if (batch_size == current_batch_size_ && d_genotype_liks_ != nullptr) {
+        return;  // Already allocated
+    }
+
+    // Free existing memory
+    free_batch_memory();
+
+    marker_t num_markers = reference_.num_markers();
+    uint32_t num_states = config_.hmm_params.num_states;
+    uint32_t checkpoint_interval = (config_.checkpoint_interval > 0) ?
+        config_.checkpoint_interval : static_cast<uint32_t>(std::sqrt(num_markers));
+    uint32_t num_checkpoints = (num_markers + checkpoint_interval - 1) / checkpoint_interval;
+
+    // Calculate sizes
+    size_t gl_size = static_cast<size_t>(batch_size) * num_markers * sizeof(GenotypeLikelihoods);
+    size_t states_size = static_cast<size_t>(batch_size) * num_markers * num_states * 2 * sizeof(haplotype_t);
+    size_t emission_size = static_cast<size_t>(batch_size) * num_markers * num_states * sizeof(prob_t);
+    size_t checkpoint_size = static_cast<size_t>(batch_size) * num_checkpoints * num_states * sizeof(prob_t);
+    size_t scaling_size = static_cast<size_t>(batch_size) * num_markers * sizeof(prob_t);
+    size_t output_size = static_cast<size_t>(batch_size) * 2 * num_markers * sizeof(allele_t);
+
+    // Allocate device memory
+    CHECK_CUDA(cudaMalloc(&d_genotype_liks_, gl_size));
+    CHECK_CUDA(cudaMalloc(&d_selected_states_, states_size));
+    CHECK_CUDA(cudaMalloc(&d_emission_probs_, emission_size));
+    CHECK_CUDA(cudaMalloc(&d_posterior_probs_, emission_size));
+    CHECK_CUDA(cudaMalloc(&d_forward_checkpoints_, checkpoint_size));
+    CHECK_CUDA(cudaMalloc(&d_scaling_factors_, scaling_size));
+    CHECK_CUDA(cudaMalloc(&d_output_haplotypes_, output_size));
+
+    // Allocate pinned host memory for async transfers (if enabled)
+    if (using_pinned_memory_) {
+        CHECK_CUDA(cudaMallocHost(&h_pinned_genotype_liks_, gl_size));
+        CHECK_CUDA(cudaMallocHost(&h_pinned_selected_states_, states_size));
+        CHECK_CUDA(cudaMallocHost(&h_pinned_output_haplotypes_, output_size));
+
+        LOG_INFO("Allocated pinned host memory for async transfers");
+    }
+
+    current_batch_size_ = batch_size;
+
+    double device_mb = (gl_size + states_size + emission_size + emission_size +
+                       checkpoint_size + scaling_size + output_size) / 1024.0 / 1024.0;
+    double total_mb = device_mb;
+
+    if (using_pinned_memory_) {
+        double pinned_mb = (gl_size + states_size + output_size) / 1024.0 / 1024.0;
+        total_mb += pinned_mb;
+        LOG_INFO("Allocated GPU memory: " + std::to_string(device_mb) + " MB device + " +
+                 std::to_string(pinned_mb) + " MB pinned host");
+    } else {
+        LOG_INFO("Allocated GPU memory for batch size " + std::to_string(batch_size) +
+                 " (" + std::to_string(total_mb) + " MB)");
+    }
+}
+
+void Imputer::free_batch_memory() {
+    // Free device memory
+    if (d_genotype_liks_) { cudaFree(d_genotype_liks_); d_genotype_liks_ = nullptr; }
+    if (d_selected_states_) { cudaFree(d_selected_states_); d_selected_states_ = nullptr; }
+    if (d_emission_probs_) { cudaFree(d_emission_probs_); d_emission_probs_ = nullptr; }
+    if (d_posterior_probs_) { cudaFree(d_posterior_probs_); d_posterior_probs_ = nullptr; }
+    if (d_forward_checkpoints_) { cudaFree(d_forward_checkpoints_); d_forward_checkpoints_ = nullptr; }
+    if (d_scaling_factors_) { cudaFree(d_scaling_factors_); d_scaling_factors_ = nullptr; }
+    if (d_output_haplotypes_) { cudaFree(d_output_haplotypes_); d_output_haplotypes_ = nullptr; }
+
+    // Free pinned host memory
+    if (h_pinned_genotype_liks_) { cudaFreeHost(h_pinned_genotype_liks_); h_pinned_genotype_liks_ = nullptr; }
+    if (h_pinned_selected_states_) { cudaFreeHost(h_pinned_selected_states_); h_pinned_selected_states_ = nullptr; }
+    if (h_pinned_output_haplotypes_) { cudaFreeHost(h_pinned_output_haplotypes_); h_pinned_output_haplotypes_ = nullptr; }
+
+    current_batch_size_ = 0;
 }
 
 void Imputer::build_index() {
@@ -625,37 +790,208 @@ void Imputer::impute_batch(
     uint32_t end_sample,
     ImputationResult& result
 ) {
-    // TODO: Implement actual GPU imputation
-    // For now, just copy observed genotypes as a placeholder
+    uint32_t batch_size = end_sample - start_sample;
+    marker_t num_markers = targets.num_markers();
+    uint32_t num_states = config_.hmm_params.num_states;
 
-    for (uint32_t s = start_sample; s < end_sample; ++s) {
-        std::vector<allele_t> hap0(targets.num_markers());
-        std::vector<allele_t> hap1(targets.num_markers());
+    LOG_INFO("Processing batch: samples " + std::to_string(start_sample) + " to " + std::to_string(end_sample));
 
-        for (marker_t m = 0; m < targets.num_markers(); ++m) {
-            auto gl = targets.get_likelihood(s, m);
+    // Lazy initialization of GPU kernels
+    if (!gpu_kernels_initialized_) {
+        initialize_gpu_kernels();
+    }
 
-            // Convert genotype likelihood to most likely genotype
-            if (gl.ll_00 > gl.ll_01 && gl.ll_00 > gl.ll_11) {
-                hap0[m] = 0;
-                hap1[m] = 0;
-            } else if (gl.ll_01 > gl.ll_11) {
-                hap0[m] = 0;
-                hap1[m] = 1;
-            } else {
-                hap0[m] = 1;
-                hap1[m] = 1;
+    // Allocate/reallocate batch memory if needed
+    if (batch_size != current_batch_size_) {
+        free_batch_memory();
+        allocate_batch_memory(batch_size);
+    }
+
+    // Copy genotype likelihoods from TargetData to GPU
+    const GenotypeLikelihoods* host_liks = targets.genotype_likelihoods();
+    size_t offset = static_cast<size_t>(start_sample) * num_markers;
+
+    CHECK_CUDA(cudaMemcpy(
+        d_genotype_liks_,
+        host_liks + offset,
+        batch_size * num_markers * sizeof(GenotypeLikelihoods),
+        cudaMemcpyHostToDevice
+    ));
+
+    // Step 1: PBWT state selection (CPU operation)
+    LOG_INFO("Running PBWT state selection for " + std::to_string(batch_size) + " samples");
+
+    std::vector<haplotype_t> h_selected_states(batch_size * num_markers * num_states * 2);
+
+    // Use PBWT-based state selection if index is available
+    if (pbwt_index_ && config_.hmm_params.use_pbwt_selection) {
+        pbwt::StateSelector selector(*pbwt_index_, num_states);
+
+        for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
+            uint32_t sample_idx = start_sample + batch_s;
+
+            // For each marker, select best matching haplotypes
+            for (marker_t m = 0; m < num_markers; ++m) {
+                std::vector<haplotype_t> best_states(num_states);
+
+                // Query PBWT for best matching haplotypes at this marker
+                // Pass nullptr for target sequence - PBWT will use internal ranking
+                pbwt_index_->select_states(m, nullptr, num_states, best_states.data());
+
+                uint64_t base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states * 2;
+
+                // Store pairs of haplotypes for each state
+                for (uint32_t k = 0; k < num_states; ++k) {
+                    haplotype_t hap_idx = best_states[k];
+                    h_selected_states[base + k * 2 + 0] = hap_idx;
+                    h_selected_states[base + k * 2 + 1] = (hap_idx + 1) % reference_.num_haplotypes();
+                }
             }
         }
+    } else {
+        // Fallback: simple selection using first L haplotypes
+        LOG_INFO("Using simple state selection (PBWT disabled or not built)");
 
-        result.set_haplotype(s, 0, hap0.data());
-        result.set_haplotype(s, 1, hap1.data());
+        for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
+            for (marker_t m = 0; m < num_markers; ++m) {
+                uint64_t base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states * 2;
+
+                for (uint32_t k = 0; k < num_states; ++k) {
+                    h_selected_states[base + k * 2 + 0] = k * 2;
+                    h_selected_states[base + k * 2 + 1] = k * 2 + 1;
+                }
+            }
+        }
     }
+
+    // Copy selected states to GPU
+    CHECK_CUDA(cudaMemcpy(
+        d_selected_states_,
+        h_selected_states.data(),
+        batch_size * num_markers * num_states * 2 * sizeof(haplotype_t),
+        cudaMemcpyHostToDevice
+    ));
+
+    // Step 2: Compute emission probabilities
+    LOG_INFO("Computing emission probabilities");
+    emission_computer_->compute(
+        d_genotype_liks_,
+        d_selected_states_,
+        d_emission_probs_,
+        batch_size,
+        true  // use_shared_memory
+    );
+
+    // Step 3: Forward-backward algorithm
+    LOG_INFO("Running forward-backward algorithm");
+
+    // Calculate checkpoint interval
+    uint32_t checkpoint_interval = static_cast<uint32_t>(std::sqrt(static_cast<float>(num_markers)));
+    if (checkpoint_interval < 1) checkpoint_interval = 1;
+
+    // Forward pass
+    kernels::launch_forward_pass(
+        d_emission_probs_,
+        transition_computer_->get_transition_matrices(),
+        d_selected_states_,
+        batch_size,
+        num_markers,
+        num_states,
+        checkpoint_interval,
+        d_forward_checkpoints_,
+        d_scaling_factors_,
+        0
+    );
+
+    // Backward pass
+    kernels::launch_backward_pass(
+        d_emission_probs_,
+        transition_computer_->get_transition_matrices(),
+        d_selected_states_,
+        d_forward_checkpoints_,
+        d_scaling_factors_,
+        batch_size,
+        num_markers,
+        num_states,
+        checkpoint_interval,
+        d_posterior_probs_,
+        0
+    );
+
+    // Step 4: Sample haplotypes
+    LOG_INFO("Sampling phased haplotypes");
+    haplotype_sampler_->sample(
+        d_posterior_probs_,
+        d_selected_states_,
+        d_output_haplotypes_,
+        batch_size,
+        false
+    );
+
+    // Step 5: Copy results back to host
+    LOG_INFO("Copying results back to host");
+
+    std::vector<allele_t> h_output_haplotypes(batch_size * 2 * num_markers);
+
+    CHECK_CUDA(cudaMemcpy(
+        h_output_haplotypes.data(),
+        d_output_haplotypes_,
+        batch_size * 2 * num_markers * sizeof(allele_t),
+        cudaMemcpyDeviceToHost
+    ));
+
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Step 6: Store results
+    for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
+        uint32_t sample_idx = start_sample + batch_s;
+
+        const allele_t* hap0 = h_output_haplotypes.data() + batch_s * 2 * num_markers;
+        const allele_t* hap1 = hap0 + num_markers;
+
+        result.set_haplotype(sample_idx, 0, hap0);
+        result.set_haplotype(sample_idx, 1, hap1);
+    }
+
+    LOG_INFO("Batch complete: samples " + std::to_string(start_sample) + " to " + std::to_string(end_sample));
 }
 
 size_t Imputer::device_memory_usage() const {
-    // TODO: Query actual GPU memory usage
-    return 0;
+    if (!gpu_kernels_initialized_) {
+        return 0;
+    }
+
+    size_t total = 0;
+
+    // GPU kernel memory
+    if (emission_computer_) {
+        total += emission_computer_->memory_usage();
+    }
+    if (transition_computer_) {
+        total += transition_computer_->memory_usage();
+    }
+    if (haplotype_sampler_) {
+        total += haplotype_sampler_->memory_usage();
+    }
+
+    // Batch memory (if allocated)
+    if (current_batch_size_ > 0) {
+        marker_t num_markers = reference_.num_markers();
+        uint32_t num_states = config_.hmm_params.num_states;
+        uint32_t num_checkpoints = static_cast<uint32_t>(
+            (num_markers + std::sqrt(num_markers) - 1) / std::sqrt(num_markers)
+        );
+
+        total += current_batch_size_ * num_markers * sizeof(GenotypeLikelihoods);
+        total += current_batch_size_ * num_markers * num_states * 2 * sizeof(haplotype_t);
+        total += current_batch_size_ * num_markers * num_states * sizeof(prob_t);
+        total += current_batch_size_ * num_markers * num_states * sizeof(prob_t);
+        total += current_batch_size_ * num_checkpoints * num_states * sizeof(prob_t);
+        total += current_batch_size_ * num_markers * sizeof(prob_t);
+        total += current_batch_size_ * 2 * num_markers * sizeof(allele_t);
+    }
+
+    return total;
 }
 
 size_t Imputer::estimate_memory_requirement(

@@ -10,6 +10,13 @@
 
 namespace swiftimpute {
 
+// Forward declarations for GPU kernels
+namespace kernels {
+    class EmissionComputer;
+    class TransitionComputer;
+    class HaplotypeSampler;
+}
+
 // Configuration for imputation
 struct ImputationConfig {
     // HMM parameters
@@ -221,16 +228,43 @@ public:
 private:
     const ReferencePanel& reference_;
     ImputationConfig config_;
-    
+
     std::unique_ptr<pbwt::PBWTIndex> pbwt_index_;
     std::unique_ptr<pbwt::GPUStateSelector> state_selector_;
     std::unique_ptr<kernels::ForwardBackward> forward_backward_;
-    
+
+    // GPU kernel instances
+    std::unique_ptr<kernels::EmissionComputer> emission_computer_;
+    std::unique_ptr<kernels::TransitionComputer> transition_computer_;
+    std::unique_ptr<kernels::HaplotypeSampler> haplotype_sampler_;
+
+    // GPU memory buffers
+    GenotypeLikelihoods* d_genotype_liks_;
+    haplotype_t* d_selected_states_;
+    prob_t* d_emission_probs_;
+    prob_t* d_posterior_probs_;
+    prob_t* d_forward_checkpoints_;
+    prob_t* d_scaling_factors_;
+    allele_t* d_output_haplotypes_;
+
+    // Pinned host memory buffers (for async transfers)
+    GenotypeLikelihoods* h_pinned_genotype_liks_;
+    haplotype_t* h_pinned_selected_states_;
+    allele_t* h_pinned_output_haplotypes_;
+
+    size_t current_batch_size_;
+    bool gpu_kernels_initialized_;
+    bool using_pinned_memory_;
+
     int device_id_;
-    
+    cudaStream_t stream_;
+
     void initialize_gpu();
+    void initialize_gpu_kernels();
+    void allocate_batch_memory(uint32_t batch_size);
+    void free_batch_memory();
     void validate_targets(const TargetData& targets);
-    
+
     void impute_batch(
         const TargetData& targets,
         uint32_t start_sample,
