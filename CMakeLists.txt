@@ -138,14 +138,15 @@ if(BUILD_TESTS)
     target_link_libraries(test_vcf_io swiftimpute_lib)
     add_test(NAME vcf_io_test COMMAND test_vcf_io)
 
+    # GPU kernel tests
+    add_executable(test_kernels test/test_kernels.cu)
+    target_link_libraries(test_kernels swiftimpute_lib)
+    add_test(NAME kernel_test COMMAND test_kernels)
+
     # TODO: Add when implemented
     # add_executable(test_pbwt test/test_pbwt.cpp)
     # target_link_libraries(test_pbwt swiftimpute_lib)
     # add_test(NAME pbwt_test COMMAND test_pbwt)
-
-    # add_executable(test_kernels test/test_kernels.cu)
-    # target_link_libraries(test_kernels swiftimpute_lib)
-    # add_test(NAME kernel_test COMMAND test_kernels)
 endif()
 
 # Benchmarks (to be implemented)

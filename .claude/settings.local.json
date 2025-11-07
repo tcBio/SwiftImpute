@@ -21,7 +21,8 @@
       "Bash(./build/Release/test_vcf_io.exe:*)",
       "Bash(git restore:*)",
       "Bash(cmake --build:*)",
-      "Bash(Select-Object -First 100)"
+      "Bash(Select-Object -First 100)",
+      "Bash(./test_kernels.exe:*)"
     ],
     "deny": [],
     "ask": []
