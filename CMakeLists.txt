@@ -70,12 +70,15 @@ set(PBWT_SOURCES
 set(KERNEL_SOURCES
     src/kernels/forward_backward.cuh
     src/kernels/forward_backward.cpp
+    src/kernels/forward_backward.cu
     src/kernels/logsumexp.cuh
     src/kernels/logsumexp.cu
     src/kernels/emission.hpp
     src/kernels/emission.cu
     src/kernels/transition.hpp
     src/kernels/transition.cu
+    src/kernels/sampling.hpp
+    src/kernels/sampling.cu
 )
 
 # I/O library
