@@ -49,21 +49,21 @@ struct DivergenceArray {
 class PBWTIndex {
 public:
     PBWTIndex() = default;
-    
+
     // Build from reference panel
     static std::unique_ptr<PBWTIndex> build(
         const allele_t* reference_panel,
         marker_t num_markers,
         haplotype_t num_haplotypes
     );
-    
+
     // Accessors
     const PrefixArray& prefix() const { return prefix_; }
     const DivergenceArray& divergence() const { return divergence_; }
-    
+
     marker_t num_markers() const { return num_markers_; }
     haplotype_t num_haplotypes() const { return num_haplotypes_; }
-    
+
     // Select L best matching states for target haplotype at marker m
     void select_states(
         marker_t m,
@@ -71,7 +71,7 @@ public:
         uint32_t L,
         haplotype_t* selected_states
     ) const;
-    
+
     // Batch select states for multiple markers
     void select_states_batch(
         marker_t start_marker,
@@ -80,16 +80,18 @@ public:
         uint32_t L,
         marker_t* selected_states    // [num_markers][L]
     ) const;
-    
+
     // Memory usage
     size_t memory_usage() const;
-    
+
 private:
+    friend class PBWTBuilder;  // Allow builder to access private members
+
     PrefixArray prefix_;
     DivergenceArray divergence_;
     marker_t num_markers_;
     haplotype_t num_haplotypes_;
-    
+
     // Internal helper for selection
     void select_states_at_marker(
         marker_t m,

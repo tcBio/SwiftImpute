@@ -52,37 +52,38 @@ include_directories(
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-# Core library (existing files only)
+# Core library
 set(CORE_SOURCES
     src/core/types.hpp
+    src/core/types.cpp
     src/core/memory_pool.hpp
     src/core/memory_pool.cu
 )
 
-# PBWT library (existing files only)
+# PBWT library
 set(PBWT_SOURCES
     src/pbwt/pbwt_index.hpp
+    src/pbwt/pbwt_index.cpp
 )
 
-# Kernel library (existing files only)
+# Kernel library
 set(KERNEL_SOURCES
     src/kernels/forward_backward.cuh
+    src/kernels/forward_backward.cpp
     src/kernels/logsumexp.cuh
     src/kernels/logsumexp.cu
 )
 
-# I/O library (to be implemented)
+# I/O library
 set(IO_SOURCES
-    # TODO: Add when implemented
-    # src/io/vcf_reader.hpp
-    # src/io/vcf_reader.cpp
-    # src/io/vcf_writer.hpp
-    # src/io/vcf_writer.cpp
+    src/io/vcf_reader.hpp
+    src/io/vcf_writer.hpp
 )
 
-# API library (existing files only)
+# API library
 set(API_SOURCES
     src/api/imputer.hpp
+    src/api/imputer.cpp
 )
 
 # Create static library
