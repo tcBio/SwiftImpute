@@ -72,6 +72,10 @@ set(KERNEL_SOURCES
     src/kernels/forward_backward.cpp
     src/kernels/logsumexp.cuh
     src/kernels/logsumexp.cu
+    src/kernels/emission.hpp
+    src/kernels/emission.cu
+    src/kernels/transition.hpp
+    src/kernels/transition.cu
 )
 
 # I/O library

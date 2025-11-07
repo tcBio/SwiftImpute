@@ -1,0 +1,14 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TARGET1	TARGET2
+chr1	1000	rs1	A	G	100	PASS	.	GT	0/1	1/1
+chr1	2000	rs2	C	T	100	PASS	.	GT	./.	1/1
+chr1	3000	rs3	G	A	100	PASS	.	GT	0/1	0/0
+chr1	4000	rs4	T	C	100	PASS	.	GT	0/1	./.
+chr1	5000	rs5	A	T	100	PASS	.	GT	1/1	0/0
+chr1	6000	rs6	C	G	100	PASS	.	GT	./.	1/1
+chr1	7000	rs7	G	C	100	PASS	.	GT	0/0	1/0
+chr1	8000	rs8	T	A	100	PASS	.	GT	0/1	0/1
+chr1	9000	rs9	A	C	100	PASS	.	GT	./.	0/0
+chr1	10000	rs10	C	A	100	PASS	.	GT	1/1	1/1

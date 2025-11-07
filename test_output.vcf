@@ -1,0 +1,19 @@
+##fileformat=VCFv4.2
+##source=SwiftImpute
+##contig=<ID=chr1>
+##INFO=<ID=IMP,Number=0,Type=Flag,Description="Imputed variant">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DS,Number=1,Type=Float,Description="Dosage (expected ALT allele count)">
+##FORMAT=<ID=GP,Number=G,Type=Float,Description="Genotype posterior probabilities">
+##FORMAT=<ID=AP,Number=2,Type=Float,Description="Allelic probabilities">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TARGET1	TARGET2
+chr1	1000	rs1	A	G	.	PASS	IMP	GT	0|1	1|1
+chr1	2000	rs2	C	T	.	PASS	IMP	GT	1|1	1|1
+chr1	3000	rs3	G	A	.	PASS	IMP	GT	0|1	0|0
+chr1	4000	rs4	T	C	.	PASS	IMP	GT	0|1	1|1
+chr1	5000	rs5	A	T	.	PASS	IMP	GT	1|1	0|0
+chr1	6000	rs6	C	G	.	PASS	IMP	GT	1|1	1|1
+chr1	7000	rs7	G	C	.	PASS	IMP	GT	0|0	0|1
+chr1	8000	rs8	T	A	.	PASS	IMP	GT	0|1	0|1
+chr1	9000	rs9	A	C	.	PASS	IMP	GT	1|1	0|0
+chr1	10000	rs10	C	A	.	PASS	IMP	GT	1|1	1|1
