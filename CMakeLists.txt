@@ -126,6 +126,11 @@ if(BUILD_TESTS)
     target_link_libraries(test_memory swiftimpute_lib)
     add_test(NAME memory_test COMMAND test_memory)
 
+    # VCF I/O and pipeline test
+    add_executable(test_vcf_io test/test_vcf_io.cpp)
+    target_link_libraries(test_vcf_io swiftimpute_lib)
+    add_test(NAME vcf_io_test COMMAND test_vcf_io)
+
     # TODO: Add when implemented
     # add_executable(test_pbwt test/test_pbwt.cpp)
     # target_link_libraries(test_pbwt swiftimpute_lib)
