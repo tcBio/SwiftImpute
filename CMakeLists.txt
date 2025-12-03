@@ -19,6 +19,7 @@ endif()
 option(USE_FAST_MATH "Enable fast math optimizations" OFF)
 option(BUILD_TESTS "Build test suite" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
+option(ENABLE_HTSLIB "Enable htslib for compressed VCF/BCF support" ON)
 
 # CUDA architectures (user can override with -DCUDA_ARCHITECTURES)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -54,11 +55,53 @@ endif()
 # Find CUDA
 find_package(CUDAToolkit REQUIRED)
 
+# Find htslib (for compressed VCF/BCF support)
+set(HTSLIB_FOUND FALSE)
+if(ENABLE_HTSLIB)
+    # Try pkg-config first
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(HTSLIB QUIET htslib)
+    endif()
+
+    if(HTSLIB_FOUND)
+        message(STATUS "Found htslib via pkg-config: ${HTSLIB_LIBRARIES}")
+    else()
+        # Try find_library as fallback
+        find_library(HTSLIB_LIBRARY NAMES hts htslib)
+        find_path(HTSLIB_INCLUDE_DIR NAMES htslib/vcf.h htslib/hts.h)
+
+        if(HTSLIB_LIBRARY AND HTSLIB_INCLUDE_DIR)
+            set(HTSLIB_FOUND TRUE)
+            set(HTSLIB_LIBRARIES ${HTSLIB_LIBRARY})
+            set(HTSLIB_INCLUDE_DIRS ${HTSLIB_INCLUDE_DIR})
+            message(STATUS "Found htslib via find_library: ${HTSLIB_LIBRARIES}")
+        else()
+            message(WARNING "htslib not found. Compressed VCF/BCF support will be disabled. "
+                           "Install htslib-dev or build with -DENABLE_HTSLIB=OFF")
+        endif()
+    endif()
+
+    if(HTSLIB_FOUND)
+        # Find zlib (required by htslib)
+        find_package(ZLIB QUIET)
+        if(NOT ZLIB_FOUND)
+            message(WARNING "zlib not found. Required by htslib.")
+        endif()
+    endif()
+endif()
+
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/src
     ${CUDAToolkit_INCLUDE_DIRS}
 )
+
+# Add htslib include directories if found
+if(HTSLIB_FOUND)
+    include_directories(${HTSLIB_INCLUDE_DIRS})
+    add_compile_definitions(HAVE_HTSLIB)
+endif()
 
 # Core library
 set(CORE_SOURCES
@@ -115,6 +158,14 @@ target_link_libraries(swiftimpute_lib
     CUDA::cudart
     CUDA::curand
 )
+
+# Link htslib if found
+if(HTSLIB_FOUND)
+    target_link_libraries(swiftimpute_lib ${HTSLIB_LIBRARIES})
+    if(ZLIB_FOUND)
+        target_link_libraries(swiftimpute_lib ZLIB::ZLIB)
+    endif()
+endif()
 
 # Set library properties
 set_target_properties(swiftimpute_lib PROPERTIES
@@ -191,4 +242,13 @@ message(STATUS "  CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "  Fast math: ${USE_FAST_MATH}")
 message(STATUS "  Build tests: ${BUILD_TESTS}")
 message(STATUS "  Build benchmarks: ${BUILD_BENCHMARKS}")
+if(ENABLE_HTSLIB)
+    if(HTSLIB_FOUND)
+        message(STATUS "  htslib support: ENABLED (${HTSLIB_LIBRARIES})")
+    else()
+        message(STATUS "  htslib support: NOT FOUND (compressed VCF disabled)")
+    endif()
+else()
+    message(STATUS "  htslib support: DISABLED")
+endif()
 message(STATUS "")

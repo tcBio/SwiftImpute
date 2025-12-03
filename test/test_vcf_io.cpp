@@ -5,6 +5,7 @@
 #include <iostream>
 #include <fstream>
 #include <cassert>
+#include <cstdlib>
 
 using namespace swiftimpute;
 
@@ -56,6 +57,98 @@ void create_test_target_vcf(const std::string& filename) {
     out.close();
 }
 
+bool test_htslib_support() {
+    std::cout << "Testing htslib support...\n";
+
+    // Check if htslib support is compiled in
+    bool has_htslib = VCFReader::has_htslib_support();
+    std::cout << "  htslib compiled in: " << (has_htslib ? "YES" : "NO") << "\n";
+
+    if (has_htslib) {
+        // Try to create a compressed VCF file using bgzip
+        std::cout << "  Testing compressed VCF reading...\n";
+
+        // Create a test VCF file
+        create_test_reference_vcf("test_htslib.vcf");
+
+        // Try to compress with bgzip
+        int ret = std::system("bgzip -c test_htslib.vcf > test_htslib.vcf.gz 2>/dev/null");
+        if (ret != 0) {
+            std::cout << "  (bgzip not available, skipping compressed VCF test)\n";
+        } else {
+            // Try to read the compressed file
+            try {
+                VCFReader reader("test_htslib.vcf.gz");
+                const auto& header = reader.read_header();
+
+                std::cout << "  Compressed VCF samples: " << header.num_samples << "\n";
+                assert(header.num_samples == 4);
+
+                auto variants = reader.read_all_variants();
+                std::cout << "  Compressed VCF variants: " << variants.size() << "\n";
+                assert(variants.size() == 10);
+
+                // Verify first variant matches expected values
+                assert(variants[0].chrom == "chr1");
+                assert(variants[0].position == 1000);
+                assert(variants[0].ref == "A");
+                assert(variants[0].alt[0] == "G");
+
+                std::cout << "  ✓ Compressed VCF reading works!\n";
+
+                // Try region query if tabix is available
+                ret = std::system("tabix -p vcf test_htslib.vcf.gz 2>/dev/null");
+                if (ret == 0) {
+                    std::cout << "  Testing region query...\n";
+                    try {
+                        VCFReader region_reader("test_htslib.vcf.gz");
+                        region_reader.read_header();
+                        auto region_variants = region_reader.read_region("chr1:3000-7000");
+                        std::cout << "  Region chr1:3000-7000 variants: " << region_variants.size() << "\n";
+                        // Should get variants at positions 3000, 4000, 5000, 6000, 7000
+                        assert(region_variants.size() == 5);
+                        std::cout << "  ✓ Region query works!\n";
+                    } catch (const std::exception& e) {
+                        std::cout << "  Region query error: " << e.what() << "\n";
+                    }
+                } else {
+                    std::cout << "  (tabix not available, skipping region query test)\n";
+                }
+
+                // Cleanup
+                std::remove("test_htslib.vcf");
+                std::remove("test_htslib.vcf.gz");
+                std::remove("test_htslib.vcf.gz.tbi");
+
+            } catch (const std::exception& e) {
+                std::cerr << "  ERROR reading compressed VCF: " << e.what() << "\n";
+                std::remove("test_htslib.vcf");
+                std::remove("test_htslib.vcf.gz");
+                return false;
+            }
+        }
+    } else {
+        // Verify that opening a .vcf.gz file throws the expected error
+        std::cout << "  Verifying .vcf.gz files are rejected without htslib...\n";
+        try {
+            VCFReader reader("nonexistent.vcf.gz");
+            std::cerr << "  ERROR: Should have thrown exception for .vcf.gz without htslib\n";
+            return false;
+        } catch (const std::runtime_error& e) {
+            std::string msg = e.what();
+            if (msg.find("htslib") != std::string::npos) {
+                std::cout << "  ✓ Correctly rejects .vcf.gz files\n";
+            } else {
+                std::cerr << "  Unexpected error: " << e.what() << "\n";
+                return false;
+            }
+        }
+    }
+
+    std::cout << "  ✓ htslib support test complete\n\n";
+    return true;
+}
+
 int main() {
     std::cout << "SwiftImpute VCF I/O Test\n";
     std::cout << "========================\n\n";
@@ -87,6 +180,11 @@ int main() {
             assert(variants[0].alt[0] == "G");
 
             std::cout << "  ✓ VCF reader working\n\n";
+        }
+
+        // Test htslib support
+        if (!test_htslib_support()) {
+            return 1;
         }
 
         // Test reference panel loading
@@ -210,10 +308,11 @@ int main() {
 
         std::cout << "Pipeline verification:\n";
         std::cout << "  1. VCF reading: ✓\n";
-        std::cout << "  2. Data loading: ✓\n";
-        std::cout << "  3. PBWT indexing: ✓\n";
-        std::cout << "  4. State selection: ✓\n";
-        std::cout << "  5. VCF writing: ✓\n\n";
+        std::cout << "  2. htslib support: " << (VCFReader::has_htslib_support() ? "✓ (enabled)" : "- (disabled)") << "\n";
+        std::cout << "  3. Data loading: ✓\n";
+        std::cout << "  4. PBWT indexing: ✓\n";
+        std::cout << "  5. State selection: ✓\n";
+        std::cout << "  6. VCF writing: ✓\n\n";
 
         std::cout << "Output files created:\n";
         std::cout << "  - test_reference.vcf\n";
