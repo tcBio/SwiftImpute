@@ -818,59 +818,138 @@ void Imputer::impute_batch(
         cudaMemcpyHostToDevice
     ));
 
-    // Step 1: PBWT state selection (CPU operation)
+    // Step 1: PBWT state selection
     LOG_INFO("Running PBWT state selection for " + std::to_string(batch_size) + " samples");
 
-    std::vector<haplotype_t> h_selected_states(batch_size * num_markers * num_states * 2);
+    // Try GPU state selection first (much faster for large datasets)
+    bool used_gpu_selection = false;
 
-    // Use PBWT-based state selection if index is available
-    if (pbwt_index_ && config_.hmm_params.use_pbwt_selection) {
-        pbwt::StateSelector selector(*pbwt_index_, num_states);
+    if (state_selector_ && config_.hmm_params.use_pbwt_selection) {
+        try {
+            // Ensure PBWT index is on GPU
+            if (!state_selector_->is_index_on_device()) {
+                LOG_INFO("Transferring PBWT index to GPU...");
+                state_selector_->transfer_index_to_device();
+            }
 
-        for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
-            uint32_t sample_idx = start_sample + batch_s;
+            LOG_INFO("Using GPU-accelerated state selection");
 
-            // For each marker, select best matching haplotypes
-            for (marker_t m = 0; m < num_markers; ++m) {
-                std::vector<haplotype_t> best_states(num_states);
+            // Allocate temporary buffer for GPU output (single haplotype per state)
+            haplotype_t* d_temp_states = nullptr;
+            size_t temp_size = static_cast<size_t>(batch_size) * num_markers * num_states;
+            CHECK_CUDA(cudaMalloc(&d_temp_states, temp_size * sizeof(haplotype_t)));
 
-                // Query PBWT for best matching haplotypes at this marker
-                // Pass nullptr for target sequence - PBWT will use internal ranking
-                pbwt_index_->select_states(m, nullptr, num_states, best_states.data());
+            // Run GPU state selection
+            state_selector_->select_on_device(
+                nullptr,  // No target haplotypes needed for PBWT-based selection
+                batch_size,
+                num_markers,
+                reinterpret_cast<marker_t*>(d_temp_states),
+                stream_
+            );
 
-                uint64_t base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states * 2;
+            // Expand single haplotypes to pairs in d_selected_states_
+            // For now, do this on CPU (can be optimized to a simple kernel later)
+            std::vector<haplotype_t> h_temp_states(temp_size);
+            CHECK_CUDA(cudaMemcpy(
+                h_temp_states.data(),
+                d_temp_states,
+                temp_size * sizeof(haplotype_t),
+                cudaMemcpyDeviceToHost
+            ));
 
-                // Store pairs of haplotypes for each state
-                for (uint32_t k = 0; k < num_states; ++k) {
-                    haplotype_t hap_idx = best_states[k];
-                    h_selected_states[base + k * 2 + 0] = hap_idx;
-                    h_selected_states[base + k * 2 + 1] = (hap_idx + 1) % reference_.num_haplotypes();
+            std::vector<haplotype_t> h_selected_states(batch_size * num_markers * num_states * 2);
+
+            for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
+                for (marker_t m = 0; m < num_markers; ++m) {
+                    uint64_t src_base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states;
+                    uint64_t dst_base = src_base * 2;
+
+                    for (uint32_t k = 0; k < num_states; ++k) {
+                        haplotype_t hap_idx = h_temp_states[src_base + k];
+                        h_selected_states[dst_base + k * 2 + 0] = hap_idx;
+                        h_selected_states[dst_base + k * 2 + 1] = (hap_idx + 1) % reference_.num_haplotypes();
+                    }
                 }
             }
-        }
-    } else {
-        // Fallback: simple selection using first L haplotypes
-        LOG_INFO("Using simple state selection (PBWT disabled or not built)");
 
-        for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
-            for (marker_t m = 0; m < num_markers; ++m) {
-                uint64_t base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states * 2;
+            // Copy to GPU
+            CHECK_CUDA(cudaMemcpy(
+                d_selected_states_,
+                h_selected_states.data(),
+                batch_size * num_markers * num_states * 2 * sizeof(haplotype_t),
+                cudaMemcpyHostToDevice
+            ));
 
-                for (uint32_t k = 0; k < num_states; ++k) {
-                    h_selected_states[base + k * 2 + 0] = k * 2;
-                    h_selected_states[base + k * 2 + 1] = k * 2 + 1;
-                }
-            }
+            cudaFree(d_temp_states);
+            used_gpu_selection = true;
+
+            LOG_INFO("GPU state selection complete");
+        } catch (const std::exception& e) {
+            LOG_WARNING("GPU state selection failed, falling back to CPU: " + std::string(e.what()));
         }
     }
 
-    // Copy selected states to GPU
-    CHECK_CUDA(cudaMemcpy(
-        d_selected_states_,
-        h_selected_states.data(),
-        batch_size * num_markers * num_states * 2 * sizeof(haplotype_t),
-        cudaMemcpyHostToDevice
-    ));
+    // Fall back to CPU state selection if GPU not available or failed
+    if (!used_gpu_selection) {
+        std::vector<haplotype_t> h_selected_states(batch_size * num_markers * num_states * 2);
+
+        // Use PBWT-based state selection if index is available
+        if (pbwt_index_ && config_.hmm_params.use_pbwt_selection) {
+            LOG_INFO("Using CPU PBWT state selection");
+            pbwt::StateSelector selector(*pbwt_index_, num_states);
+
+            for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
+                uint32_t sample_idx = start_sample + batch_s;
+
+                // For each marker, select best matching haplotypes
+                for (marker_t m = 0; m < num_markers; ++m) {
+                    std::vector<haplotype_t> best_states(num_states);
+
+                    // Query PBWT for best matching haplotypes at this marker
+                    // Pass nullptr for target sequence - PBWT will use internal ranking
+                    pbwt_index_->select_states(m, nullptr, num_states, best_states.data());
+
+                    uint64_t base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states * 2;
+
+                    // Store pairs of haplotypes for each state
+                    for (uint32_t k = 0; k < num_states; ++k) {
+                        haplotype_t hap_idx = best_states[k];
+                        h_selected_states[base + k * 2 + 0] = hap_idx;
+                        h_selected_states[base + k * 2 + 1] = (hap_idx + 1) % reference_.num_haplotypes();
+                    }
+                }
+
+                // Log progress for CPU selection (can be slow)
+                if ((batch_s + 1) % 10 == 0 || batch_s == batch_size - 1) {
+                    LOG_INFO("CPU state selection: sample " + std::to_string(batch_s + 1) + "/" +
+                             std::to_string(batch_size));
+                }
+            }
+        } else {
+            // Fallback: simple selection using first L haplotypes
+            LOG_INFO("Using simple state selection (PBWT disabled or not built)");
+
+            for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
+                for (marker_t m = 0; m < num_markers; ++m) {
+                    uint64_t base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states * 2;
+
+                    for (uint32_t k = 0; k < num_states; ++k) {
+                        h_selected_states[base + k * 2 + 0] = k * 2;
+                        h_selected_states[base + k * 2 + 1] = k * 2 + 1;
+                    }
+                }
+            }
+        }
+
+        // Copy selected states to GPU
+        CHECK_CUDA(cudaMemcpy(
+            d_selected_states_,
+            h_selected_states.data(),
+            batch_size * num_markers * num_states * 2 * sizeof(haplotype_t),
+            cudaMemcpyHostToDevice
+        ));
+    }
 
     // Step 2: Compute emission probabilities
     LOG_INFO("Computing emission probabilities");

@@ -207,16 +207,25 @@ public:
     );
     
     size_t device_memory_usage() const;
-    
+
+    // Check if index has been transferred to GPU
+    bool is_index_on_device() const { return index_on_device_; }
+
 private:
     const PBWTIndex& index_;
     uint32_t num_states_;
     int device_id_;
-    
-    // Device memory for PBWT index
+
+    // Device memory for PBWT index (managed via DevicePtr wrapper)
     DevicePtr<haplotype_t> d_prefix_;
     DevicePtr<marker_t> d_divergence_;
-    
+
+    // Raw device pointers (for direct management when DevicePtr doesn't fit)
+    haplotype_t* d_prefix_raw_ = nullptr;
+    marker_t* d_divergence_raw_ = nullptr;
+    bool memory_allocated_ = false;
+    bool index_on_device_ = false;
+
     void allocate_device_memory();
     void free_device_memory();
 };
@@ -247,6 +256,48 @@ bool validate_pbwt_index(
 // Save/load PBWT index
 void save_pbwt_index(const PBWTIndex& index, const std::string& filename);
 std::unique_ptr<PBWTIndex> load_pbwt_index(const std::string& filename);
+
+// ============================================================================
+// GPU state selection functions (implemented in pbwt_selector.cu)
+// ============================================================================
+
+// Launch GPU kernel for state selection
+void launch_select_states(
+    const haplotype_t* d_prefix,
+    const marker_t* d_divergence,
+    const allele_t* d_target_haplotypes,
+    uint32_t num_samples,
+    uint32_t num_markers,
+    uint32_t num_haplotypes,
+    uint32_t num_states_L,
+    haplotype_t* d_selected_states,
+    cudaStream_t stream = 0
+);
+
+// GPU memory management for state selector
+void gpu_state_selector_allocate(
+    const PBWTIndex& index,
+    int device_id,
+    haplotype_t** d_prefix,
+    marker_t** d_divergence
+);
+
+void gpu_state_selector_transfer(
+    const PBWTIndex& index,
+    haplotype_t* d_prefix,
+    marker_t* d_divergence,
+    cudaStream_t stream = 0
+);
+
+void gpu_state_selector_free(
+    haplotype_t* d_prefix,
+    marker_t* d_divergence
+);
+
+size_t gpu_state_selector_memory_usage(
+    marker_t num_markers,
+    haplotype_t num_haplotypes
+);
 
 } // namespace pbwt
 } // namespace swiftimpute
