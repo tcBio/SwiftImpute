@@ -301,6 +301,12 @@ marker_t StateSelector::compute_divergence_score(
     return m;
 }
 
+// ============================================================================
+// GPUStateSelector implementation
+// Note: GPU kernel functions are declared in pbwt_index.hpp and implemented
+// in pbwt_selector.cu
+// ============================================================================
+
 // GPUStateSelector implementation
 GPUStateSelector::GPUStateSelector(
     const PBWTIndex& index,
@@ -310,16 +316,58 @@ GPUStateSelector::GPUStateSelector(
     num_states_(num_states),
     device_id_(device_id)
 {
-    // TODO: Implement GPU memory allocation
+    allocate_device_memory();
+    LOG_INFO("GPUStateSelector initialized for " + std::to_string(index.num_markers()) +
+             " markers, " + std::to_string(index.num_haplotypes()) + " haplotypes, L=" +
+             std::to_string(num_states));
 }
 
 GPUStateSelector::~GPUStateSelector() {
-    // TODO: Implement GPU memory cleanup
+    free_device_memory();
+}
+
+void GPUStateSelector::allocate_device_memory() {
+    haplotype_t* prefix_ptr = nullptr;
+    marker_t* divergence_ptr = nullptr;
+
+    gpu_state_selector_allocate(index_, device_id_, &prefix_ptr, &divergence_ptr);
+
+    d_prefix_ = DevicePtr<haplotype_t>();
+    d_divergence_ = DevicePtr<marker_t>();
+
+    // Store raw pointers - we'll manage them ourselves
+    // Note: DevicePtr doesn't support taking ownership of existing pointers,
+    // so we store them directly and manage manually
+    d_prefix_raw_ = prefix_ptr;
+    d_divergence_raw_ = divergence_ptr;
+    memory_allocated_ = true;
+}
+
+void GPUStateSelector::free_device_memory() {
+    if (memory_allocated_) {
+        gpu_state_selector_free(d_prefix_raw_, d_divergence_raw_);
+        d_prefix_raw_ = nullptr;
+        d_divergence_raw_ = nullptr;
+        memory_allocated_ = false;
+    }
 }
 
 void GPUStateSelector::transfer_index_to_device() {
-    // TODO: Implement index transfer to GPU
-    throw ImputationError("GPU state selection not yet implemented");
+    if (!memory_allocated_) {
+        throw ImputationError("GPU memory not allocated for state selector");
+    }
+
+    LOG_INFO("Transferring PBWT index to GPU device " + std::to_string(device_id_));
+
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreate(&stream));
+
+    gpu_state_selector_transfer(index_, d_prefix_raw_, d_divergence_raw_, stream);
+
+    CHECK_CUDA(cudaStreamDestroy(stream));
+
+    index_on_device_ = true;
+    LOG_INFO("PBWT index transfer complete");
 }
 
 void GPUStateSelector::select_on_device(
@@ -329,8 +377,23 @@ void GPUStateSelector::select_on_device(
     marker_t* d_selected_states,
     cudaStream_t stream
 ) {
-    // TODO: Implement GPU state selection
-    throw ImputationError("GPU state selection not yet implemented");
+    if (!index_on_device_) {
+        throw ImputationError("PBWT index not transferred to device - call transfer_index_to_device() first");
+    }
+
+    // Cast marker_t* to haplotype_t* since they're both uint32_t
+    // The kernel outputs haplotype indices into the selected_states array
+    launch_select_states(
+        d_prefix_raw_,
+        d_divergence_raw_,
+        d_target_haplotypes,
+        num_samples,
+        num_markers,
+        index_.num_haplotypes(),
+        num_states_,
+        reinterpret_cast<haplotype_t*>(d_selected_states),
+        stream
+    );
 }
 
 void GPUStateSelector::select(
@@ -339,21 +402,46 @@ void GPUStateSelector::select(
     marker_t num_markers,
     marker_t* h_selected_states
 ) {
-    // TODO: Implement host wrapper with data transfer
-    throw ImputationError("GPU state selection not yet implemented");
+    if (!index_on_device_) {
+        transfer_index_to_device();
+    }
+
+    // Allocate device memory for target haplotypes and results
+    size_t target_size = static_cast<size_t>(num_samples) * 2 * num_markers;
+    size_t result_size = static_cast<size_t>(num_samples) * num_markers * num_states_;
+
+    allele_t* d_target = nullptr;
+    marker_t* d_selected = nullptr;
+
+    CHECK_CUDA(cudaMalloc(&d_target, target_size * sizeof(allele_t)));
+    CHECK_CUDA(cudaMalloc(&d_selected, result_size * sizeof(marker_t)));
+
+    // Copy input to device
+    CHECK_CUDA(cudaMemcpy(d_target, h_target_haplotypes,
+                          target_size * sizeof(allele_t), cudaMemcpyHostToDevice));
+
+    // Create stream for this operation
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreate(&stream));
+
+    // Run selection kernel
+    select_on_device(d_target, num_samples, num_markers, d_selected, stream);
+
+    // Synchronize
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+
+    // Copy results back to host
+    CHECK_CUDA(cudaMemcpy(h_selected_states, d_selected,
+                          result_size * sizeof(marker_t), cudaMemcpyDeviceToHost));
+
+    // Cleanup
+    CHECK_CUDA(cudaStreamDestroy(stream));
+    CHECK_CUDA(cudaFree(d_target));
+    CHECK_CUDA(cudaFree(d_selected));
 }
 
 size_t GPUStateSelector::device_memory_usage() const {
-    // TODO: Implement memory usage calculation
-    return 0;
-}
-
-void GPUStateSelector::allocate_device_memory() {
-    // TODO: Implement device memory allocation
-}
-
-void GPUStateSelector::free_device_memory() {
-    // TODO: Implement device memory deallocation
+    return gpu_state_selector_memory_usage(index_.num_markers(), index_.num_haplotypes());
 }
 
 } // namespace pbwt

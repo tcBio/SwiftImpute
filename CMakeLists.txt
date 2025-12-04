@@ -115,6 +115,7 @@ set(CORE_SOURCES
 set(PBWT_SOURCES
     src/pbwt/pbwt_index.hpp
     src/pbwt/pbwt_index.cpp
+    src/pbwt/pbwt_selector.cu
 )
 
 # Kernel library

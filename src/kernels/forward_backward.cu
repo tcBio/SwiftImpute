@@ -399,5 +399,290 @@ LaunchConfig calculate_launch_config(
     return config;
 }
 
+// ============================================================================
+// Windowed Forward Pass Kernel
+// ============================================================================
+
+__global__ void forward_pass_windowed_kernel(
+    const prob_t* __restrict__ emission_probs,
+    const prob_t* __restrict__ transition_matrix,
+    uint32_t total_markers,
+    uint32_t window_start,
+    uint32_t window_size,
+    uint32_t num_states,
+    uint32_t checkpoint_interval,
+    prob_t* __restrict__ forward_checkpoints,
+    prob_t* __restrict__ scaling_factors,
+    const prob_t* __restrict__ initial_alpha,
+    prob_t* __restrict__ final_alpha
+) {
+    uint32_t sample_idx = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+
+    extern __shared__ prob_t shared_mem[];
+    prob_t* alpha_curr = shared_mem;
+    prob_t* alpha_prev = &shared_mem[num_states];
+
+    uint64_t emission_base = static_cast<uint64_t>(sample_idx) * total_markers * num_states;
+    uint32_t num_checkpoints = (window_size + checkpoint_interval - 1) / checkpoint_interval;
+    uint64_t checkpoint_base = static_cast<uint64_t>(sample_idx) * num_checkpoints * num_states;
+    uint64_t scaling_base = static_cast<uint64_t>(sample_idx) * window_size;
+
+    // Initialize: use initial_alpha if provided, else use emissions at window_start
+    if (tid < num_states) {
+        if (initial_alpha != nullptr) {
+            alpha_curr[tid] = initial_alpha[sample_idx * num_states + tid];
+        } else {
+            alpha_curr[tid] = emission_probs[emission_base + window_start * num_states + tid];
+        }
+    }
+    __syncthreads();
+
+    // Scale initial values
+    if (tid == 0) {
+        prob_t max_val = alpha_curr[0];
+        for (uint32_t s = 1; s < num_states; ++s) max_val = fmaxf(max_val, alpha_curr[s]);
+        scaling_factors[scaling_base] = max_val;
+        for (uint32_t s = 0; s < num_states; ++s) alpha_curr[s] -= max_val;
+    }
+    __syncthreads();
+
+    // Save initial checkpoint
+    if (tid < num_states) forward_checkpoints[checkpoint_base + tid] = alpha_curr[tid];
+
+    // Forward pass through window
+    for (uint32_t w = 1; w < window_size; ++w) {
+        marker_t m = window_start + w;
+        if (m >= total_markers) break;
+
+        prob_t* temp = alpha_prev; alpha_prev = alpha_curr; alpha_curr = temp;
+        __syncthreads();
+
+        if (tid < num_states) {
+            prob_t sum = LOG_ZERO;
+            for (uint32_t from = 0; from < num_states; ++from) {
+                prob_t val = alpha_prev[from] + transition_matrix[from * num_states + tid];
+                sum = logsumexp2(sum, val);
+            }
+            alpha_curr[tid] = sum + emission_probs[emission_base + m * num_states + tid];
+        }
+        __syncthreads();
+
+        // Scaling
+        if (tid == 0) {
+            prob_t max_val = alpha_curr[0];
+            for (uint32_t s = 1; s < num_states; ++s) max_val = fmaxf(max_val, alpha_curr[s]);
+            scaling_factors[scaling_base + w] = max_val;
+            for (uint32_t s = 0; s < num_states; ++s) alpha_curr[s] -= max_val;
+        }
+        __syncthreads();
+
+        // Checkpoint
+        if (w % checkpoint_interval == 0 && tid < num_states) {
+            uint32_t cp_idx = w / checkpoint_interval;
+            forward_checkpoints[checkpoint_base + cp_idx * num_states + tid] = alpha_curr[tid];
+        }
+    }
+
+    // Save final alpha for next window
+    if (final_alpha != nullptr && tid < num_states) {
+        final_alpha[sample_idx * num_states + tid] = alpha_curr[tid];
+    }
+}
+
+// ============================================================================
+// Windowed Backward Pass Kernel
+// ============================================================================
+
+__global__ void backward_pass_windowed_kernel(
+    const prob_t* __restrict__ emission_probs,
+    const prob_t* __restrict__ transition_matrix,
+    const prob_t* __restrict__ forward_checkpoints,
+    const prob_t* __restrict__ scaling_factors,
+    uint32_t total_markers,
+    uint32_t window_start,
+    uint32_t window_size,
+    uint32_t num_states,
+    uint32_t checkpoint_interval,
+    prob_t* __restrict__ posterior_probs,
+    const prob_t* __restrict__ initial_beta,
+    prob_t* __restrict__ final_beta
+) {
+    uint32_t sample_idx = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+
+    extern __shared__ prob_t shared_mem[];
+    prob_t* beta_curr = shared_mem;
+    prob_t* beta_prev = &shared_mem[num_states];
+    prob_t* alpha_recomp = &shared_mem[2 * num_states];
+
+    uint64_t emission_base = static_cast<uint64_t>(sample_idx) * total_markers * num_states;
+    uint32_t num_checkpoints = (window_size + checkpoint_interval - 1) / checkpoint_interval;
+    uint64_t checkpoint_base = static_cast<uint64_t>(sample_idx) * num_checkpoints * num_states;
+    uint64_t scaling_base = static_cast<uint64_t>(sample_idx) * window_size;
+    uint64_t posterior_base = static_cast<uint64_t>(sample_idx) * total_markers * num_states;
+
+    uint32_t window_end = window_start + window_size - 1;
+    if (window_end >= total_markers) window_end = total_markers - 1;
+    uint32_t actual_window_size = window_end - window_start + 1;
+
+    // Initialize beta
+    if (tid < num_states) {
+        beta_curr[tid] = (initial_beta != nullptr) ?
+            initial_beta[sample_idx * num_states + tid] : LOG_ONE;
+    }
+    __syncthreads();
+
+    // Load last checkpoint and recompute to end
+    uint32_t last_cp = (actual_window_size - 1) / checkpoint_interval;
+    if (tid < num_states) alpha_recomp[tid] = forward_checkpoints[checkpoint_base + last_cp * num_states + tid];
+    __syncthreads();
+
+    for (uint32_t w = last_cp * checkpoint_interval + 1; w < actual_window_size; ++w) {
+        marker_t m = window_start + w;
+        if (tid < num_states) {
+            prob_t sum = LOG_ZERO;
+            for (uint32_t from = 0; from < num_states; ++from) {
+                sum = logsumexp2(sum, alpha_recomp[from] + transition_matrix[from * num_states + tid]);
+            }
+            alpha_recomp[tid] = sum + emission_probs[emission_base + m * num_states + tid] -
+                               scaling_factors[scaling_base + w];
+        }
+        __syncthreads();
+    }
+
+    // Compute posterior at last marker
+    if (tid < num_states) {
+        posterior_probs[posterior_base + window_end * num_states + tid] = alpha_recomp[tid] + beta_curr[tid];
+    }
+    __syncthreads();
+
+    // Backward through window
+    for (int w = actual_window_size - 2; w >= 0; --w) {
+        marker_t m = window_start + w;
+        prob_t* temp = beta_prev; beta_prev = beta_curr; beta_curr = temp;
+        __syncthreads();
+
+        if (tid < num_states) {
+            prob_t sum = LOG_ZERO;
+            for (uint32_t to = 0; to < num_states; ++to) {
+                prob_t val = transition_matrix[tid * num_states + to] +
+                            emission_probs[emission_base + (m + 1) * num_states + to] + beta_prev[to];
+                sum = logsumexp2(sum, val);
+            }
+            beta_curr[tid] = sum;
+        }
+        __syncthreads();
+
+        // Recompute or load alpha
+        uint32_t cp_idx = w / checkpoint_interval;
+        uint32_t cp_marker = cp_idx * checkpoint_interval;
+
+        if (tid < num_states) alpha_recomp[tid] = forward_checkpoints[checkpoint_base + cp_idx * num_states + tid];
+        __syncthreads();
+
+        for (uint32_t ww = cp_marker + 1; ww <= static_cast<uint32_t>(w); ++ww) {
+            marker_t mm = window_start + ww;
+            if (tid < num_states) {
+                prob_t sum = LOG_ZERO;
+                for (uint32_t from = 0; from < num_states; ++from) {
+                    sum = logsumexp2(sum, alpha_recomp[from] + transition_matrix[from * num_states + tid]);
+                }
+                alpha_recomp[tid] = sum + emission_probs[emission_base + mm * num_states + tid] -
+                                   scaling_factors[scaling_base + ww];
+            }
+            __syncthreads();
+        }
+
+        if (tid < num_states) {
+            posterior_probs[posterior_base + m * num_states + tid] = alpha_recomp[tid] + beta_curr[tid];
+        }
+        __syncthreads();
+    }
+
+    // Save final beta
+    if (final_beta != nullptr && tid < num_states) {
+        final_beta[sample_idx * num_states + tid] = beta_curr[tid];
+    }
+
+    // Normalize posteriors for this window
+    for (uint32_t w = 0; w < actual_window_size; ++w) {
+        marker_t m = window_start + w;
+        __syncthreads();
+        if (tid < num_states) alpha_recomp[tid] = posterior_probs[posterior_base + m * num_states + tid];
+        __syncthreads();
+
+        if (tid == 0) {
+            prob_t log_sum = LOG_ZERO;
+            for (uint32_t s = 0; s < num_states; ++s) log_sum = logsumexp2(log_sum, alpha_recomp[s]);
+            beta_curr[0] = log_sum;
+        }
+        __syncthreads();
+
+        if (tid < num_states) {
+            posterior_probs[posterior_base + m * num_states + tid] = alpha_recomp[tid] - beta_curr[0];
+        }
+    }
+}
+
+// ============================================================================
+// Windowed Launch Functions
+// ============================================================================
+
+void launch_forward_pass_windowed(
+    const prob_t* d_emission_probs,
+    const prob_t* d_transition_matrix,
+    uint32_t num_samples,
+    uint32_t total_markers,
+    uint32_t window_start,
+    uint32_t window_size,
+    uint32_t num_states,
+    uint32_t checkpoint_interval,
+    prob_t* d_forward_checkpoints,
+    prob_t* d_scaling_factors,
+    const prob_t* d_initial_alpha,
+    prob_t* d_final_alpha,
+    cudaStream_t stream
+) {
+    dim3 grid(num_samples);
+    dim3 block(std::min(num_states, 256u));
+    size_t shared_mem = 2 * num_states * sizeof(prob_t);
+
+    forward_pass_windowed_kernel<<<grid, block, shared_mem, stream>>>(
+        d_emission_probs, d_transition_matrix, total_markers, window_start,
+        window_size, num_states, checkpoint_interval, d_forward_checkpoints,
+        d_scaling_factors, d_initial_alpha, d_final_alpha
+    );
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void launch_backward_pass_windowed(
+    const prob_t* d_emission_probs,
+    const prob_t* d_transition_matrix,
+    const prob_t* d_forward_checkpoints,
+    const prob_t* d_scaling_factors,
+    uint32_t num_samples,
+    uint32_t total_markers,
+    uint32_t window_start,
+    uint32_t window_size,
+    uint32_t num_states,
+    uint32_t checkpoint_interval,
+    prob_t* d_posterior_probs,
+    const prob_t* d_initial_beta,
+    prob_t* d_final_beta,
+    cudaStream_t stream
+) {
+    dim3 grid(num_samples);
+    dim3 block(std::min(num_states, 256u));
+    size_t shared_mem = 3 * num_states * sizeof(prob_t);
+
+    backward_pass_windowed_kernel<<<grid, block, shared_mem, stream>>>(
+        d_emission_probs, d_transition_matrix, d_forward_checkpoints,
+        d_scaling_factors, total_markers, window_start, window_size,
+        num_states, checkpoint_interval, d_posterior_probs, d_initial_beta, d_final_beta
+    );
+    CHECK_CUDA(cudaGetLastError());
+}
+
 } // namespace kernels
 } // namespace swiftimpute

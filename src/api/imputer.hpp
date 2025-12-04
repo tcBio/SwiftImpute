@@ -21,22 +21,26 @@ namespace kernels {
 struct ImputationConfig {
     // HMM parameters
     HMMParameters hmm_params;
-    
+
     // Computational parameters
     int device_id;                  // GPU device ID (-1 for auto-select)
     uint32_t batch_size;            // Number of samples per GPU batch
     uint32_t num_threads;           // CPU threads for I/O and preprocessing
     bool use_pinned_memory;         // Use pinned memory for faster transfers
-    
+
     // Output options
     bool output_dosages;            // Output DS field (dosage 0-2)
     bool output_probabilities;      // Output GP field (3 probabilities)
     bool output_info_score;         // Output INFO quality score
     bool deterministic;             // Deterministic mode (argmax vs sampling)
-    
+
+    // Windowed processing (critical for large datasets)
+    uint32_t window_size;           // Markers per window (0 = no windowing, process all at once)
+    uint32_t window_overlap;        // Overlap between windows for boundary smoothing
+
     // Checkpointing
-    uint32_t checkpoint_interval;   // 0 = auto-calculate
-    
+    uint32_t checkpoint_interval;   // 0 = auto-calculate based on window_size
+
     ImputationConfig() :
         device_id(-1),
         batch_size(100),
@@ -46,6 +50,8 @@ struct ImputationConfig {
         output_probabilities(true),
         output_info_score(true),
         deterministic(false),
+        window_size(10000),         // Default: 10K markers per window
+        window_overlap(100),        // Default: 100 marker overlap
         checkpoint_interval(0) {}
 };
 
@@ -270,6 +276,13 @@ private:
         uint32_t start_sample,
         uint32_t end_sample,
         ImputationResult& result
+    );
+
+    // Windowed forward-backward for large datasets
+    void run_windowed_forward_backward(
+        uint32_t batch_size,
+        uint32_t num_markers,
+        uint32_t num_states
     );
 };
 
