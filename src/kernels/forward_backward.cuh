@@ -233,6 +233,46 @@ void launch_backward_pass(
     cudaStream_t stream = 0
 );
 
+// ============================================================================
+// Windowed Forward-Backward (for large marker counts)
+// ============================================================================
+
+// Launch windowed forward pass - processes a subset of markers
+// This allows processing millions of markers by breaking into manageable windows
+void launch_forward_pass_windowed(
+    const prob_t* d_emission_probs,      // Full emission array [samples][total_markers][states]
+    const prob_t* d_transition_matrix,   // Transition matrix
+    uint32_t num_samples,
+    uint32_t total_markers,              // Total markers in dataset
+    uint32_t window_start,               // First marker in this window
+    uint32_t window_size,                // Number of markers in this window
+    uint32_t num_states,
+    uint32_t checkpoint_interval,
+    prob_t* d_forward_checkpoints,       // Window checkpoints [samples][window_checkpoints][states]
+    prob_t* d_scaling_factors,           // Window scaling [samples][window_size]
+    const prob_t* d_initial_alpha,       // Initial alpha from previous window (nullptr for first window)
+    prob_t* d_final_alpha,               // Output: final alpha for next window [samples][states]
+    cudaStream_t stream = 0
+);
+
+// Launch windowed backward pass
+void launch_backward_pass_windowed(
+    const prob_t* d_emission_probs,
+    const prob_t* d_transition_matrix,
+    const prob_t* d_forward_checkpoints,
+    const prob_t* d_scaling_factors,
+    uint32_t num_samples,
+    uint32_t total_markers,
+    uint32_t window_start,
+    uint32_t window_size,
+    uint32_t num_states,
+    uint32_t checkpoint_interval,
+    prob_t* d_posterior_probs,           // Output posteriors for this window
+    const prob_t* d_initial_beta,        // Initial beta from next window (nullptr for last window)
+    prob_t* d_final_beta,                // Output: final beta for previous window [samples][states]
+    cudaStream_t stream = 0
+);
+
 // Launch emission computation
 void launch_compute_emissions(
     const GenotypeLikelihoods* d_genotype_liks,

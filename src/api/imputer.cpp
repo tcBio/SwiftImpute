@@ -882,41 +882,47 @@ void Imputer::impute_batch(
         true  // use_shared_memory
     );
 
-    // Step 3: Forward-backward algorithm
-    LOG_INFO("Running forward-backward algorithm");
+    // Step 3: Forward-backward algorithm (windowed for large datasets)
+    uint32_t window_size = config_.window_size;
+    bool use_windowing = (window_size > 0 && num_markers > window_size);
 
-    // Calculate checkpoint interval
-    uint32_t checkpoint_interval = static_cast<uint32_t>(std::sqrt(static_cast<float>(num_markers)));
-    if (checkpoint_interval < 1) checkpoint_interval = 1;
+    if (use_windowing) {
+        LOG_INFO("Running windowed forward-backward (" + std::to_string(num_markers) +
+                 " markers, window=" + std::to_string(window_size) + ")");
+        run_windowed_forward_backward(batch_size, num_markers, num_states);
+    } else {
+        LOG_INFO("Running forward-backward algorithm");
 
-    // Forward pass
-    kernels::launch_forward_pass(
-        d_emission_probs_,
-        transition_computer_->get_transition_matrices(),
-        d_selected_states_,
-        batch_size,
-        num_markers,
-        num_states,
-        checkpoint_interval,
-        d_forward_checkpoints_,
-        d_scaling_factors_,
-        0
-    );
+        uint32_t checkpoint_interval = static_cast<uint32_t>(std::sqrt(static_cast<float>(num_markers)));
+        if (checkpoint_interval < 1) checkpoint_interval = 1;
 
-    // Backward pass
-    kernels::launch_backward_pass(
-        d_emission_probs_,
-        transition_computer_->get_transition_matrices(),
-        d_selected_states_,
-        d_forward_checkpoints_,
-        d_scaling_factors_,
-        batch_size,
-        num_markers,
-        num_states,
-        checkpoint_interval,
-        d_posterior_probs_,
-        0
-    );
+        kernels::launch_forward_pass(
+            d_emission_probs_,
+            transition_computer_->get_transition_matrices(),
+            d_selected_states_,
+            batch_size,
+            num_markers,
+            num_states,
+            checkpoint_interval,
+            d_forward_checkpoints_,
+            d_scaling_factors_,
+            0
+        );
+
+        kernels::launch_backward_pass(
+            d_emission_probs_,
+            transition_computer_->get_transition_matrices(),
+            d_selected_states_,
+            d_forward_checkpoints_,
+            d_scaling_factors_,
+            batch_size,
+            num_markers,
+            num_states,
+            checkpoint_interval,
+            d_posterior_probs_,
+            0
+        );
+    }
 
     // Step 4: Sample haplotypes
     LOG_INFO("Sampling phased haplotypes");
@@ -954,6 +960,138 @@ void Imputer::impute_batch(
     }
 
     LOG_INFO("Batch complete: samples " + std::to_string(start_sample) + " to " + std::to_string(end_sample));
+}
+
+void Imputer::run_windowed_forward_backward(
+    uint32_t batch_size,
+    uint32_t num_markers,
+    uint32_t num_states
+) {
+    uint32_t window_size = config_.window_size;
+    uint32_t num_windows = (num_markers + window_size - 1) / window_size;
+
+    // Checkpoint interval based on window size (much smaller than √total_markers)
+    uint32_t checkpoint_interval = static_cast<uint32_t>(std::sqrt(static_cast<float>(window_size)));
+    if (checkpoint_interval < 1) checkpoint_interval = 1;
+
+    uint32_t num_checkpoints = (window_size + checkpoint_interval - 1) / checkpoint_interval;
+
+    // Allocate window-specific buffers
+    prob_t* d_window_checkpoints = nullptr;
+    prob_t* d_window_scaling = nullptr;
+    prob_t* d_alpha_boundary = nullptr;
+    prob_t* d_beta_boundary = nullptr;
+
+    size_t cp_size = static_cast<size_t>(batch_size) * num_checkpoints * num_states * sizeof(prob_t);
+    size_t scale_size = static_cast<size_t>(batch_size) * window_size * sizeof(prob_t);
+    size_t boundary_size = static_cast<size_t>(batch_size) * num_states * sizeof(prob_t);
+
+    CHECK_CUDA(cudaMalloc(&d_window_checkpoints, cp_size));
+    CHECK_CUDA(cudaMalloc(&d_window_scaling, scale_size));
+    CHECK_CUDA(cudaMalloc(&d_alpha_boundary, boundary_size));
+    CHECK_CUDA(cudaMalloc(&d_beta_boundary, boundary_size));
+
+    LOG_INFO("Processing " + std::to_string(num_windows) + " windows (checkpoint_interval=" +
+             std::to_string(checkpoint_interval) + ")");
+
+    // Store final alphas from each window for backward pass
+    std::vector<prob_t> h_final_alphas(num_windows * batch_size * num_states);
+
+    // Forward pass through all windows
+    for (uint32_t w = 0; w < num_windows; ++w) {
+        uint32_t win_start = w * window_size;
+        uint32_t win_size = std::min(window_size, num_markers - win_start);
+
+        kernels::launch_forward_pass_windowed(
+            d_emission_probs_,
+            transition_computer_->get_transition_matrices(),
+            batch_size,
+            num_markers,
+            win_start,
+            win_size,
+            num_states,
+            checkpoint_interval,
+            d_window_checkpoints,
+            d_window_scaling,
+            (w > 0) ? d_alpha_boundary : nullptr,  // Use previous window's final alpha
+            d_alpha_boundary,  // Output final alpha for next window
+            0
+        );
+
+        // Save final alpha for backward pass
+        CHECK_CUDA(cudaMemcpy(
+            h_final_alphas.data() + w * batch_size * num_states,
+            d_alpha_boundary,
+            boundary_size,
+            cudaMemcpyDeviceToHost
+        ));
+
+        if ((w + 1) % 100 == 0 || w == num_windows - 1) {
+            LOG_INFO("Forward: window " + std::to_string(w + 1) + "/" + std::to_string(num_windows));
+        }
+    }
+
+    // Backward pass through all windows (reverse order)
+    for (int w = num_windows - 1; w >= 0; --w) {
+        uint32_t win_start = w * window_size;
+        uint32_t win_size = std::min(window_size, num_markers - win_start);
+
+        // Reload checkpoints for this window (recompute forward within window)
+        // Copy alpha from forward pass to boundary buffer
+        CHECK_CUDA(cudaMemcpy(
+            d_alpha_boundary,
+            h_final_alphas.data() + w * batch_size * num_states,
+            boundary_size,
+            cudaMemcpyHostToDevice
+        ));
+
+        // Recompute forward checkpoints for this window
+        kernels::launch_forward_pass_windowed(
+            d_emission_probs_,
+            transition_computer_->get_transition_matrices(),
+            batch_size,
+            num_markers,
+            win_start,
+            win_size,
+            num_states,
+            checkpoint_interval,
+            d_window_checkpoints,
+            d_window_scaling,
+            (w > 0) ? d_alpha_boundary : nullptr,
+            nullptr,  // Don't need to save final alpha again
+            0
+        );
+
+        // Run backward pass for this window
+        kernels::launch_backward_pass_windowed(
+            d_emission_probs_,
+            transition_computer_->get_transition_matrices(),
+            d_window_checkpoints,
+            d_window_scaling,
+            batch_size,
+            num_markers,
+            win_start,
+            win_size,
+            num_states,
+            checkpoint_interval,
+            d_posterior_probs_,
+            (w < static_cast<int>(num_windows) - 1) ? d_beta_boundary : nullptr,
+            d_beta_boundary,  // Output final beta for previous window
+            0
+        );
+
+        if ((num_windows - w) % 100 == 0 || w == 0) {
+            LOG_INFO("Backward: window " + std::to_string(num_windows - w) + "/" + std::to_string(num_windows));
+        }
+    }
+
+    // Clean up window buffers
+    cudaFree(d_window_checkpoints);
+    cudaFree(d_window_scaling);
+    cudaFree(d_alpha_boundary);
+    cudaFree(d_beta_boundary);
+
+    LOG_INFO("Windowed forward-backward complete");
 }
 
 size_t Imputer::device_memory_usage() const {
