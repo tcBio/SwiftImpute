@@ -1,5 +1,6 @@
 #include "api/imputer.hpp"
 #include "core/types.hpp"
+#include "phasing/pre_phaser.hpp"
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -22,6 +23,7 @@ struct CommandLineArgs {
     bool benchmark = false;
     bool verbose = false;
     bool per_chromosome = false;      // Process each chromosome separately
+    bool skip_prephase = false;       // Skip pre-phasing (assume input is phased)
 
     bool parse(int argc, char* argv[]) {
         for (int i = 1; i < argc; i++) {
@@ -53,6 +55,8 @@ struct CommandLineArgs {
                 benchmark = true;
             } else if (arg == "--verbose" || arg == "-v") {
                 verbose = true;
+            } else if (arg == "--no-prephase" || arg == "--skip-prephase") {
+                skip_prephase = true;
             } else if (arg == "--help" || arg == "-h") {
                 return false;
             }
@@ -72,6 +76,7 @@ struct CommandLineArgs {
         std::cout << "  --region REGION         Genomic region (chr:start-end)\n";
         std::cout << "  --chr, --chromosome CHR Process only specified chromosome\n";
         std::cout << "  --per-chromosome        Process each chromosome separately\n";
+        std::cout << "  --no-prephase           Skip pre-phasing (assume input is phased)\n";
         std::cout << "  -g, --gpu ID            GPU device ID (-1 for auto-select)\n";
         std::cout << "  -s, --states N          Number of HMM states [default: 8]\n";
         std::cout << "  --ne N                  Effective population size [default: 10000]\n";
@@ -105,6 +110,41 @@ void process_chromosome(
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    // Pre-phasing step (if not skipped)
+    const TargetData* targets_to_use = &target_chrom;
+    std::unique_ptr<TargetData> phased_targets;
+
+    if (!args.skip_prephase) {
+        // Check if phasing is needed
+        auto phase_status = phasing::PrePhaser::detect_phase_status(target_chrom);
+
+        if (!phase_status.is_fully_phased) {
+            LOG_INFO("  Detected unphased genotypes (" +
+                     std::to_string(100.0 * (1.0 - phase_status.phased_fraction)) +
+                     "% unphased)");
+            LOG_INFO("  Running pre-phasing...");
+
+            phasing::PrePhasingConfig prephase_config;
+            prephase_config.num_states = config.hmm_params.num_states;
+            prephase_config.ne = config.hmm_params.ne;
+            prephase_config.verbose = args.verbose;
+
+            phasing::PrePhaser prephaser(ref_chrom, prephase_config);
+            phased_targets = prephaser.phase(target_chrom);
+
+            if (phased_targets) {
+                targets_to_use = phased_targets.get();
+                LOG_INFO("  Pre-phasing complete");
+            } else {
+                LOG_INFO("  Pre-phasing returned null - using original targets");
+            }
+        } else {
+            LOG_INFO("  Target data is fully phased - skipping pre-phasing");
+        }
+    } else {
+        LOG_INFO("  Pre-phasing skipped (--no-prephase)");
+    }
+
     // Create imputer for this chromosome
     Imputer imputer(ref_chrom, config);
 
@@ -115,7 +155,7 @@ void process_chromosome(
     // Run imputation
     LOG_INFO("  Running imputation...");
     auto result = imputer.impute_with_progress(
-        target_chrom,
+        *targets_to_use,
         [&chrom_name](uint32_t completed, uint32_t total) {
             if (completed % 100 == 0 || completed == total) {
                 double percent = 100.0 * completed / total;
@@ -296,6 +336,48 @@ int main(int argc, char* argv[]) {
 
         } else {
             // Single-pass processing (original behavior for single-chromosome data)
+
+            // Pre-phasing step (if not skipped)
+            const TargetData* targets_to_use = targets.get();
+            std::unique_ptr<TargetData> phased_targets;
+
+            if (!args.skip_prephase) {
+                // Check if phasing is needed
+                auto phase_status = phasing::PrePhaser::detect_phase_status(*targets);
+
+                if (!phase_status.is_fully_phased) {
+                    LOG_INFO("Detected unphased genotypes (" +
+                             std::to_string(100.0 * (1.0 - phase_status.phased_fraction)) +
+                             "% unphased)");
+                    LOG_INFO("Running pre-phasing...");
+                    start_time = std::chrono::high_resolution_clock::now();
+
+                    phasing::PrePhasingConfig prephase_config;
+                    prephase_config.num_states = config.hmm_params.num_states;
+                    prephase_config.ne = config.hmm_params.ne;
+                    prephase_config.verbose = args.verbose;
+
+                    phasing::PrePhaser prephaser(*reference, prephase_config);
+                    phased_targets = prephaser.phase(*targets);
+
+                    auto prephase_time = std::chrono::high_resolution_clock::now();
+                    auto prephase_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        prephase_time - start_time
+                    ).count();
+
+                    if (phased_targets) {
+                        targets_to_use = phased_targets.get();
+                        LOG_INFO("Pre-phasing complete in " + std::to_string(prephase_duration) + " ms");
+                    } else {
+                        LOG_INFO("Pre-phasing returned null - using original targets");
+                    }
+                } else {
+                    LOG_INFO("Target data is fully phased - skipping pre-phasing");
+                }
+            } else {
+                LOG_INFO("Pre-phasing skipped (--no-prephase)");
+            }
+
             LOG_INFO("Initializing imputer...");
             Imputer imputer(*reference, config);
 
@@ -317,7 +399,7 @@ int main(int argc, char* argv[]) {
             start_time = std::chrono::high_resolution_clock::now();
 
             auto result = imputer.impute_with_progress(
-                *targets,
+                *targets_to_use,
                 [](uint32_t completed, uint32_t total) {
                     if (completed % 100 == 0 || completed == total) {
                         double percent = 100.0 * completed / total;

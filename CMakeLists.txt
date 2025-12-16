@@ -151,6 +151,12 @@ set(VALIDATION_SOURCES
     src/validation/accuracy_metrics.cpp
 )
 
+# Phasing library
+set(PHASING_SOURCES
+    src/phasing/pre_phaser.hpp
+    src/phasing/pre_phaser.cpp
+)
+
 # Create static library
 add_library(swiftimpute_lib STATIC
     ${CORE_SOURCES}
@@ -159,6 +165,7 @@ add_library(swiftimpute_lib STATIC
     ${IO_SOURCES}
     ${API_SOURCES}
     ${VALIDATION_SOURCES}
+    ${PHASING_SOURCES}
 )
 
 # Link CUDA libraries

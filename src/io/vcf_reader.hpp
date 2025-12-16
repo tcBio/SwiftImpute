@@ -35,6 +35,7 @@ public:
         std::string ref;
         std::vector<std::string> alt;
         std::vector<std::vector<allele_t>> genotypes;  // [sample][haplotype]
+        std::vector<bool> is_phased;  // [sample] - true if this sample's genotype is phased
         double qual;
         std::string id;
     };
@@ -106,7 +107,7 @@ private:
     // Parsing helpers for plain text
     void parse_header_line(const std::string& line);
     bool parse_variant_line(const std::string& line, Variant& variant);
-    std::vector<allele_t> parse_genotype(const std::string& gt_str);
+    std::pair<std::vector<allele_t>, bool> parse_genotype(const std::string& gt_str);
 
     // File type detection
     bool is_gzipped(const std::string& filename) const;
@@ -117,7 +118,7 @@ private:
     // htslib parsing helpers
     void parse_hts_header();
     bool read_hts_variant(Variant& variant);
-    std::vector<allele_t> parse_hts_genotype(int32_t* gt_arr, int ngt);
+    std::pair<std::vector<allele_t>, bool> parse_hts_genotype(int32_t* gt_arr, int ngt);
 #endif
 };
 
@@ -320,9 +321,10 @@ inline void VCFReader::parse_hts_header() {
     }
 }
 
-inline std::vector<allele_t> VCFReader::parse_hts_genotype(int32_t* gt_arr, int ngt) {
+inline std::pair<std::vector<allele_t>, bool> VCFReader::parse_hts_genotype(int32_t* gt_arr, int ngt) {
     std::vector<allele_t> gt;
     gt.reserve(ngt);
+    bool is_phased = true;  // Assume phased until we see otherwise
 
     for (int i = 0; i < ngt; ++i) {
         if (gt_arr[i] == bcf_int32_vector_end) {
@@ -332,10 +334,14 @@ inline std::vector<allele_t> VCFReader::parse_hts_genotype(int32_t* gt_arr, int 
             gt.push_back(ALLELE_MISSING);
         } else {
             gt.push_back(static_cast<allele_t>(bcf_gt_allele(gt_arr[i])));
+            // Check if phased (bit 0 set means phased in bcf encoding)
+            if (i > 0 && !bcf_gt_is_phased(gt_arr[i])) {
+                is_phased = false;
+            }
         }
     }
 
-    return gt;
+    return {gt, is_phased};
 }
 
 inline bool VCFReader::read_hts_variant(Variant& variant) {
@@ -385,15 +391,17 @@ inline bool VCFReader::read_hts_variant(Variant& variant) {
     int ngt = bcf_get_genotypes(hts_header_, hts_record_, &gt_arr, &ngt_arr);
 
     variant.genotypes.clear();
+    variant.is_phased.clear();
     if (ngt > 0 && gt_arr) {
         int nsamples = bcf_hdr_nsamples(hts_header_);
         int ploidy = ngt / nsamples;
 
         variant.genotypes.reserve(nsamples);
+        variant.is_phased.reserve(nsamples);
         for (int s = 0; s < nsamples; ++s) {
-            variant.genotypes.push_back(
-                parse_hts_genotype(gt_arr + s * ploidy, ploidy)
-            );
+            auto [gt, phased] = parse_hts_genotype(gt_arr + s * ploidy, ploidy);
+            variant.genotypes.push_back(gt);
+            variant.is_phased.push_back(phased);
         }
     }
 
@@ -524,15 +532,19 @@ inline bool VCFReader::parse_variant_line(const std::string& line, Variant& vari
 
     // Parse genotypes (assuming GT is first in FORMAT)
     variant.genotypes.clear();
+    variant.is_phased.clear();
     for (size_t i = 9; i < fields.size(); ++i) {
-        variant.genotypes.push_back(parse_genotype(fields[i]));
+        auto [gt, phased] = parse_genotype(fields[i]);
+        variant.genotypes.push_back(gt);
+        variant.is_phased.push_back(phased);
     }
 
     return true;
 }
 
-inline std::vector<allele_t> VCFReader::parse_genotype(const std::string& gt_str) {
+inline std::pair<std::vector<allele_t>, bool> VCFReader::parse_genotype(const std::string& gt_str) {
     std::vector<allele_t> gt;
+    bool is_phased = false;
 
     // Find the GT field (first field in FORMAT)
     size_t colon_pos = gt_str.find(':');
@@ -541,16 +553,28 @@ inline std::vector<allele_t> VCFReader::parse_genotype(const std::string& gt_str
         : gt_str;
 
     // Parse phased (|) or unphased (/) genotypes
-    size_t delim_pos = gt_field.find_first_of("|/");
-    if (delim_pos == std::string::npos) {
+    size_t pipe_pos = gt_field.find('|');
+    size_t slash_pos = gt_field.find('/');
+
+    if (pipe_pos == std::string::npos && slash_pos == std::string::npos) {
         // Haploid or missing
         if (gt_field == ".") {
             gt.push_back(ALLELE_MISSING);
         } else {
             gt.push_back(static_cast<allele_t>(std::stoi(gt_field)));
         }
+        is_phased = true;  // Haploid is considered phased
     } else {
-        // Diploid
+        // Diploid - check which delimiter is used
+        size_t delim_pos;
+        if (pipe_pos != std::string::npos) {
+            is_phased = true;
+            delim_pos = pipe_pos;
+        } else {
+            is_phased = false;
+            delim_pos = slash_pos;
+        }
+
         std::string allele1 = gt_field.substr(0, delim_pos);
         std::string allele2 = gt_field.substr(delim_pos + 1);
 
@@ -558,7 +582,7 @@ inline std::vector<allele_t> VCFReader::parse_genotype(const std::string& gt_str
         gt.push_back(allele2 == "." ? ALLELE_MISSING : std::stoi(allele2));
     }
 
-    return gt;
+    return {gt, is_phased};
 }
 
 inline std::vector<VCFReader::Variant> VCFReader::read_all_variants() {
