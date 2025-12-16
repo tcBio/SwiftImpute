@@ -235,10 +235,20 @@ if(BUILD_TESTS)
     target_link_libraries(test_accuracy swiftimpute_lib)
     add_test(NAME accuracy_test COMMAND test_accuracy)
 
-    # TODO: Add when implemented
-    # add_executable(test_pbwt test/test_pbwt.cpp)
-    # target_link_libraries(test_pbwt swiftimpute_lib)
-    # add_test(NAME pbwt_test COMMAND test_pbwt)
+    # Pre-phasing tests
+    add_executable(test_phasing test/test_phasing.cpp)
+    target_link_libraries(test_phasing swiftimpute_lib)
+    add_test(NAME phasing_test COMMAND test_phasing)
+
+    # Streaming loader tests
+    add_executable(test_streaming test/test_streaming.cpp)
+    target_link_libraries(test_streaming swiftimpute_lib)
+    add_test(NAME streaming_test COMMAND test_streaming)
+
+    # X chromosome handling tests
+    add_executable(test_x_chromosome test/test_x_chromosome.cpp)
+    target_link_libraries(test_x_chromosome swiftimpute_lib)
+    add_test(NAME x_chromosome_test COMMAND test_x_chromosome)
 endif()
 
 # Benchmarks (to be implemented)
