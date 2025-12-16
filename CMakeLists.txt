@@ -145,6 +145,12 @@ set(API_SOURCES
     src/api/imputer.cpp
 )
 
+# Validation library
+set(VALIDATION_SOURCES
+    src/validation/accuracy_metrics.hpp
+    src/validation/accuracy_metrics.cpp
+)
+
 # Create static library
 add_library(swiftimpute_lib STATIC
     ${CORE_SOURCES}
@@ -152,6 +158,7 @@ add_library(swiftimpute_lib STATIC
     ${KERNEL_SOURCES}
     ${IO_SOURCES}
     ${API_SOURCES}
+    ${VALIDATION_SOURCES}
 )
 
 # Link CUDA libraries
@@ -202,6 +209,11 @@ if(BUILD_TESTS)
     add_executable(test_kernels test/test_kernels.cu)
     target_link_libraries(test_kernels swiftimpute_lib)
     add_test(NAME kernel_test COMMAND test_kernels)
+
+    # Accuracy metrics tests
+    add_executable(test_accuracy test/test_accuracy.cpp)
+    target_link_libraries(test_accuracy swiftimpute_lib)
+    add_test(NAME accuracy_test COMMAND test_accuracy)
 
     # TODO: Add when implemented
     # add_executable(test_pbwt test/test_pbwt.cpp)
