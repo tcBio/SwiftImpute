@@ -78,16 +78,22 @@ public:
     marker_t num_markers() const { return markers_.size(); }
     haplotype_t num_haplotypes() const { return num_haplotypes_; }
     sample_t num_samples() const { return num_haplotypes_ / 2; }
-    
+
     const std::vector<Marker>& markers() const { return markers_; }
     const std::vector<Sample>& samples() const { return samples_; }
-    
+
     // Get haplotype data
     const allele_t* haplotypes() const { return haplotypes_.get(); }
     allele_t get_allele(marker_t m, haplotype_t h) const;
-    
+
     // Memory usage
     size_t memory_usage() const;
+
+    // Multi-chromosome support
+    std::vector<std::string> get_chromosomes() const;
+
+    // Filter to specific chromosome
+    std::unique_ptr<ReferencePanel> filter_chromosome(const std::string& chrom) const;
     
 private:
     std::vector<Marker> markers_;
@@ -125,12 +131,18 @@ public:
     const GenotypeLikelihoods* genotype_likelihoods() const {
         return genotype_liks_.get();
     }
-    
+
     GenotypeLikelihoods get_likelihood(sample_t s, marker_t m) const;
-    
+
     // Memory usage
     size_t memory_usage() const;
-    
+
+    // Multi-chromosome support
+    std::vector<std::string> get_chromosomes() const;
+
+    // Filter to specific chromosome
+    std::unique_ptr<TargetData> filter_chromosome(const std::string& chrom) const;
+
 private:
     std::vector<Marker> markers_;
     std::vector<Sample> samples_;

@@ -27,10 +27,17 @@ struct Marker {
     uint64_t pos;               // Physical position
     std::string id;             // Variant ID (rsID)
     std::string ref;            // Reference allele
-    std::string alt;            // Alternate allele
+    std::string alt;            // Alternate allele (primary for biallelic)
+    std::vector<std::string> alt_alleles;  // All alternate alleles (for multi-allelic)
     double cM;                  // Genetic position in centiMorgans
-    
-    Marker() : pos(0), cM(0.0) {}
+    uint8_t n_alleles;          // Number of alleles (2 for biallelic, >2 for multi-allelic)
+    bool is_multiallelic;       // True if decomposed from multi-allelic site
+    uint8_t allele_index;       // Which ALT allele this represents (0-based)
+
+    Marker() : pos(0), cM(0.0), n_alleles(2), is_multiallelic(false), allele_index(0) {}
+
+    // Check if this is a biallelic variant
+    bool is_biallelic() const { return n_alleles == 2; }
 };
 
 // Sample information

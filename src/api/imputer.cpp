@@ -51,19 +51,64 @@ std::unique_ptr<ReferencePanel> ReferencePanel::load_vcf(
 
     LOG_INFO("Read " + std::to_string(variants.size()) + " variants");
 
-    // Build markers
+    // Build markers with multi-allelic decomposition
+    // Multi-allelic sites are split into multiple biallelic markers
     std::vector<Marker> markers;
-    markers.reserve(variants.size());
+    markers.reserve(variants.size() * 2);  // Reserve extra for multi-allelic
 
-    for (const auto& v : variants) {
-        Marker m;
-        m.chrom = v.chrom;
-        m.pos = v.position;
-        m.id = v.id;
-        m.ref = v.ref;
-        m.alt = v.alt.empty() ? "" : v.alt[0];  // Take first ALT allele
-        m.cM = 0.0;  // Will be computed later if genetic map provided
-        markers.push_back(m);
+    // Track which original variant each marker came from
+    std::vector<std::pair<size_t, uint8_t>> marker_origin;  // (variant_idx, alt_allele_idx)
+    marker_origin.reserve(variants.size() * 2);
+
+    size_t multiallelic_count = 0;
+
+    for (size_t v_idx = 0; v_idx < variants.size(); ++v_idx) {
+        const auto& v = variants[v_idx];
+
+        if (v.alt.empty()) {
+            // No ALT allele - skip
+            continue;
+        }
+
+        if (v.alt.size() == 1) {
+            // Biallelic - single marker
+            Marker m;
+            m.chrom = v.chrom;
+            m.pos = v.position;
+            m.id = v.id;
+            m.ref = v.ref;
+            m.alt = v.alt[0];
+            m.alt_alleles = v.alt;
+            m.n_alleles = 2;
+            m.is_multiallelic = false;
+            m.allele_index = 0;
+            m.cM = 0.0;
+            markers.push_back(m);
+            marker_origin.emplace_back(v_idx, 0);
+        } else {
+            // Multi-allelic - decompose into biallelic markers
+            multiallelic_count++;
+            for (uint8_t alt_idx = 0; alt_idx < v.alt.size(); ++alt_idx) {
+                Marker m;
+                m.chrom = v.chrom;
+                m.pos = v.position;
+                m.id = v.id + "_" + std::to_string(alt_idx + 1);  // e.g., rs123_1, rs123_2
+                m.ref = v.ref;
+                m.alt = v.alt[alt_idx];
+                m.alt_alleles = v.alt;
+                m.n_alleles = static_cast<uint8_t>(v.alt.size() + 1);
+                m.is_multiallelic = true;
+                m.allele_index = alt_idx;
+                m.cM = 0.0;
+                markers.push_back(m);
+                marker_origin.emplace_back(v_idx, alt_idx);
+            }
+        }
+    }
+
+    if (multiallelic_count > 0) {
+        LOG_INFO("Decomposed " + std::to_string(multiallelic_count) +
+                 " multi-allelic sites into " + std::to_string(markers.size()) + " biallelic markers");
     }
 
     // Build samples
@@ -81,32 +126,49 @@ std::unique_ptr<ReferencePanel> ReferencePanel::load_vcf(
     size_t total_size = static_cast<size_t>(markers.size()) * num_haplotypes;
     auto haplotypes = std::make_unique<allele_t[]>(total_size);
 
-    // Fill haplotype data [marker][haplotype]
-    for (size_t m = 0; m < variants.size(); ++m) {
-        const auto& variant = variants[m];
+    // Fill haplotype data [marker][haplotype] with decomposition
+    for (size_t m_idx = 0; m_idx < markers.size(); ++m_idx) {
+        const auto& [v_idx, alt_idx] = marker_origin[m_idx];
+        const auto& variant = variants[v_idx];
+        const auto& marker = markers[m_idx];
 
         for (size_t s = 0; s < header.num_samples; ++s) {
             if (s >= variant.genotypes.size()) {
                 // Missing sample data
-                haplotypes[m * num_haplotypes + s * 2 + 0] = ALLELE_MISSING;
-                haplotypes[m * num_haplotypes + s * 2 + 1] = ALLELE_MISSING;
+                haplotypes[m_idx * num_haplotypes + s * 2 + 0] = ALLELE_MISSING;
+                haplotypes[m_idx * num_haplotypes + s * 2 + 1] = ALLELE_MISSING;
                 continue;
             }
 
             const auto& gt = variant.genotypes[s];
 
+            auto convert_allele = [&marker, alt_idx](allele_t orig_allele) -> allele_t {
+                if (orig_allele == ALLELE_MISSING) return ALLELE_MISSING;
+                if (orig_allele == 0) return 0;  // REF stays REF
+
+                if (marker.is_multiallelic) {
+                    // For decomposed multi-allelic: only specific ALT -> 1, others -> 0
+                    // e.g., for alt_idx=1: allele 2 -> 1, alleles 1,3,4... -> 0
+                    return (orig_allele == alt_idx + 1) ? 1 : 0;
+                } else {
+                    // Biallelic: any non-zero -> 1
+                    return (orig_allele > 0) ? 1 : 0;
+                }
+            };
+
             if (gt.size() >= 2) {
                 // Diploid genotype
-                haplotypes[m * num_haplotypes + s * 2 + 0] = gt[0];
-                haplotypes[m * num_haplotypes + s * 2 + 1] = gt[1];
+                haplotypes[m_idx * num_haplotypes + s * 2 + 0] = convert_allele(gt[0]);
+                haplotypes[m_idx * num_haplotypes + s * 2 + 1] = convert_allele(gt[1]);
             } else if (gt.size() == 1) {
                 // Haploid or homozygous
-                haplotypes[m * num_haplotypes + s * 2 + 0] = gt[0];
-                haplotypes[m * num_haplotypes + s * 2 + 1] = gt[0];
+                allele_t a = convert_allele(gt[0]);
+                haplotypes[m_idx * num_haplotypes + s * 2 + 0] = a;
+                haplotypes[m_idx * num_haplotypes + s * 2 + 1] = a;
             } else {
                 // Missing
-                haplotypes[m * num_haplotypes + s * 2 + 0] = ALLELE_MISSING;
-                haplotypes[m * num_haplotypes + s * 2 + 1] = ALLELE_MISSING;
+                haplotypes[m_idx * num_haplotypes + s * 2 + 0] = ALLELE_MISSING;
+                haplotypes[m_idx * num_haplotypes + s * 2 + 1] = ALLELE_MISSING;
             }
         }
     }
@@ -163,6 +225,66 @@ size_t ReferencePanel::memory_usage() const {
     return total;
 }
 
+std::vector<std::string> ReferencePanel::get_chromosomes() const {
+    std::vector<std::string> chroms;
+    std::string last_chrom;
+
+    for (const auto& m : markers_) {
+        if (m.chrom != last_chrom) {
+            chroms.push_back(m.chrom);
+            last_chrom = m.chrom;
+        }
+    }
+
+    return chroms;
+}
+
+std::unique_ptr<ReferencePanel> ReferencePanel::filter_chromosome(const std::string& chrom) const {
+    // Find markers for this chromosome
+    std::vector<size_t> marker_indices;
+    for (size_t i = 0; i < markers_.size(); ++i) {
+        if (markers_[i].chrom == chrom) {
+            marker_indices.push_back(i);
+        }
+    }
+
+    if (marker_indices.empty()) {
+        throw ImputationError("No markers found for chromosome: " + chrom);
+    }
+
+    // Build filtered markers
+    std::vector<Marker> filtered_markers;
+    filtered_markers.reserve(marker_indices.size());
+    for (size_t idx : marker_indices) {
+        filtered_markers.push_back(markers_[idx]);
+    }
+
+    // Copy samples (unchanged)
+    std::vector<Sample> filtered_samples = samples_;
+
+    // Build filtered haplotypes
+    size_t new_size = marker_indices.size() * num_haplotypes_;
+    auto filtered_haplotypes = std::make_unique<allele_t[]>(new_size);
+
+    for (size_t new_m = 0; new_m < marker_indices.size(); ++new_m) {
+        size_t old_m = marker_indices[new_m];
+        for (haplotype_t h = 0; h < num_haplotypes_; ++h) {
+            filtered_haplotypes[new_m * num_haplotypes_ + h] =
+                haplotypes_[old_m * num_haplotypes_ + h];
+        }
+    }
+
+    LOG_INFO("Filtered reference to chromosome " + chrom + ": " +
+             std::to_string(filtered_markers.size()) + " markers");
+
+    return std::unique_ptr<ReferencePanel>(new ReferencePanel(
+        std::move(filtered_markers),
+        std::move(filtered_samples),
+        num_haplotypes_,
+        std::move(filtered_haplotypes)
+    ));
+}
+
 // TargetData implementation
 
 TargetData::TargetData(
@@ -201,19 +323,62 @@ std::unique_ptr<TargetData> TargetData::load_vcf(
 
     LOG_INFO("Read " + std::to_string(variants.size()) + " variants");
 
-    // Build markers
+    // Build markers with multi-allelic decomposition
     std::vector<Marker> markers;
-    markers.reserve(variants.size());
+    markers.reserve(variants.size() * 2);
 
-    for (const auto& v : variants) {
-        Marker m;
-        m.chrom = v.chrom;
-        m.pos = v.position;
-        m.id = v.id;
-        m.ref = v.ref;
-        m.alt = v.alt.empty() ? "" : v.alt[0];
-        m.cM = 0.0;
-        markers.push_back(m);
+    // Track which original variant each marker came from
+    std::vector<std::pair<size_t, uint8_t>> marker_origin;  // (variant_idx, alt_allele_idx)
+    marker_origin.reserve(variants.size() * 2);
+
+    size_t multiallelic_count = 0;
+
+    for (size_t v_idx = 0; v_idx < variants.size(); ++v_idx) {
+        const auto& v = variants[v_idx];
+
+        if (v.alt.empty()) {
+            continue;
+        }
+
+        if (v.alt.size() == 1) {
+            // Biallelic
+            Marker m;
+            m.chrom = v.chrom;
+            m.pos = v.position;
+            m.id = v.id;
+            m.ref = v.ref;
+            m.alt = v.alt[0];
+            m.alt_alleles = v.alt;
+            m.n_alleles = 2;
+            m.is_multiallelic = false;
+            m.allele_index = 0;
+            m.cM = 0.0;
+            markers.push_back(m);
+            marker_origin.emplace_back(v_idx, 0);
+        } else {
+            // Multi-allelic - decompose
+            multiallelic_count++;
+            for (uint8_t alt_idx = 0; alt_idx < v.alt.size(); ++alt_idx) {
+                Marker m;
+                m.chrom = v.chrom;
+                m.pos = v.position;
+                m.id = v.id + "_" + std::to_string(alt_idx + 1);
+                m.ref = v.ref;
+                m.alt = v.alt[alt_idx];
+                m.alt_alleles = v.alt;
+                m.n_alleles = static_cast<uint8_t>(v.alt.size() + 1);
+                m.is_multiallelic = true;
+                m.allele_index = alt_idx;
+                m.cM = 0.0;
+                markers.push_back(m);
+                marker_origin.emplace_back(v_idx, alt_idx);
+            }
+        }
+    }
+
+    if (multiallelic_count > 0) {
+        LOG_INFO("Decomposed " + std::to_string(multiallelic_count) +
+                 " multi-allelic sites into " + std::to_string(markers.size()) + " biallelic markers");
     }
 
     // Build samples
@@ -227,28 +392,20 @@ std::unique_ptr<TargetData> TargetData::load_vcf(
     }
 
     // Allocate genotype likelihood array [sample][marker]
-    size_t total_size = header.num_samples * variants.size();
+    size_t total_size = header.num_samples * markers.size();
     auto genotype_liks = std::make_unique<GenotypeLikelihoods[]>(total_size);
 
-    // Convert observed genotypes to genotype likelihoods
-    // For perfect data (hard calls), we use:
-    //   P(D|AA) = 1.0 if GT=0/0, else 0.0
-    //   P(D|AB) = 1.0 if GT=0/1, else 0.0
-    //   P(D|BB) = 1.0 if GT=1/1, else 0.0
-    //
-    // In log10 scale:
-    //   LL_AA = 0.0 if GT=0/0, else -999.0 (essentially 0 probability)
-    //   LL_AB = 0.0 if GT=0/1, else -999.0
-    //   LL_BB = 0.0 if GT=1/1, else -999.0
-
+    // Convert observed genotypes to genotype likelihoods with decomposition
     const prob_t LOG10_ZERO = -999.0f;
     const prob_t LOG10_ONE = 0.0f;
 
-    for (size_t m = 0; m < variants.size(); ++m) {
-        const auto& variant = variants[m];
+    for (size_t m_idx = 0; m_idx < markers.size(); ++m_idx) {
+        const auto& [v_idx, alt_idx] = marker_origin[m_idx];
+        const auto& variant = variants[v_idx];
+        const auto& marker = markers[m_idx];
 
         for (size_t s = 0; s < header.num_samples; ++s) {
-            size_t idx = s * variants.size() + m;
+            size_t idx = s * markers.size() + m_idx;
 
             if (s >= variant.genotypes.size()) {
                 // Missing data - uniform likelihood
@@ -266,27 +423,35 @@ std::unique_ptr<TargetData> TargetData::load_vcf(
                 genotype_liks[idx].ll_01 = LOG10_ONE;
                 genotype_liks[idx].ll_11 = LOG10_ONE;
             } else {
-                // Hard call genotype
-                allele_t a1 = gt[0];
-                allele_t a2 = gt[1];
+                // Convert alleles for decomposed multi-allelic
+                auto convert_allele = [&marker, alt_idx](allele_t orig_allele) -> allele_t {
+                    if (orig_allele == ALLELE_MISSING) return ALLELE_MISSING;
+                    if (orig_allele == 0) return 0;
+
+                    if (marker.is_multiallelic) {
+                        return (orig_allele == alt_idx + 1) ? 1 : 0;
+                    } else {
+                        return (orig_allele > 0) ? 1 : 0;
+                    }
+                };
+
+                allele_t a1 = convert_allele(gt[0]);
+                allele_t a2 = convert_allele(gt[1]);
 
                 if (a1 == 0 && a2 == 0) {
-                    // 0/0
                     genotype_liks[idx].ll_00 = LOG10_ONE;
                     genotype_liks[idx].ll_01 = LOG10_ZERO;
                     genotype_liks[idx].ll_11 = LOG10_ZERO;
                 } else if ((a1 == 0 && a2 == 1) || (a1 == 1 && a2 == 0)) {
-                    // 0/1 or 1/0
                     genotype_liks[idx].ll_00 = LOG10_ZERO;
                     genotype_liks[idx].ll_01 = LOG10_ONE;
                     genotype_liks[idx].ll_11 = LOG10_ZERO;
                 } else if (a1 == 1 && a2 == 1) {
-                    // 1/1
                     genotype_liks[idx].ll_00 = LOG10_ZERO;
                     genotype_liks[idx].ll_01 = LOG10_ZERO;
                     genotype_liks[idx].ll_11 = LOG10_ONE;
                 } else {
-                    // Other genotype (should not happen for biallelic)
+                    // Unexpected - uniform likelihood
                     genotype_liks[idx].ll_00 = LOG10_ONE;
                     genotype_liks[idx].ll_01 = LOG10_ONE;
                     genotype_liks[idx].ll_11 = LOG10_ONE;
@@ -326,6 +491,66 @@ size_t TargetData::memory_usage() const {
     total += samples_.size() * markers_.size() * sizeof(GenotypeLikelihoods);
 
     return total;
+}
+
+std::vector<std::string> TargetData::get_chromosomes() const {
+    std::vector<std::string> chroms;
+    std::string last_chrom;
+
+    for (const auto& m : markers_) {
+        if (m.chrom != last_chrom) {
+            chroms.push_back(m.chrom);
+            last_chrom = m.chrom;
+        }
+    }
+
+    return chroms;
+}
+
+std::unique_ptr<TargetData> TargetData::filter_chromosome(const std::string& chrom) const {
+    // Find markers for this chromosome
+    std::vector<size_t> marker_indices;
+    for (size_t i = 0; i < markers_.size(); ++i) {
+        if (markers_[i].chrom == chrom) {
+            marker_indices.push_back(i);
+        }
+    }
+
+    if (marker_indices.empty()) {
+        throw ImputationError("No markers found for chromosome: " + chrom);
+    }
+
+    // Build filtered markers
+    std::vector<Marker> filtered_markers;
+    filtered_markers.reserve(marker_indices.size());
+    for (size_t idx : marker_indices) {
+        filtered_markers.push_back(markers_[idx]);
+    }
+
+    // Copy samples (unchanged)
+    std::vector<Sample> filtered_samples = samples_;
+
+    // Build filtered genotype likelihoods [sample][marker]
+    size_t new_size = samples_.size() * marker_indices.size();
+    auto filtered_liks = std::make_unique<GenotypeLikelihoods[]>(new_size);
+
+    for (size_t s = 0; s < samples_.size(); ++s) {
+        for (size_t new_m = 0; new_m < marker_indices.size(); ++new_m) {
+            size_t old_m = marker_indices[new_m];
+            size_t new_idx = s * marker_indices.size() + new_m;
+            size_t old_idx = s * markers_.size() + old_m;
+            filtered_liks[new_idx] = genotype_liks_[old_idx];
+        }
+    }
+
+    LOG_INFO("Filtered target to chromosome " + chrom + ": " +
+             std::to_string(filtered_markers.size()) + " markers");
+
+    return std::unique_ptr<TargetData>(new TargetData(
+        std::move(filtered_markers),
+        std::move(filtered_samples),
+        std::move(filtered_liks)
+    ));
 }
 
 // ImputationResult implementation
