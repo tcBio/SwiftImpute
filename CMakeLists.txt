@@ -137,6 +137,8 @@ set(KERNEL_SOURCES
 set(IO_SOURCES
     src/io/vcf_reader.hpp
     src/io/vcf_writer.hpp
+    src/io/streaming_loader.hpp
+    src/io/streaming_loader.cpp
 )
 
 # API library
@@ -157,6 +159,12 @@ set(PHASING_SOURCES
     src/phasing/pre_phaser.cpp
 )
 
+# Special handling (X chromosome, etc.)
+set(SPECIAL_SOURCES
+    src/special/x_chromosome.hpp
+    src/special/x_chromosome.cpp
+)
+
 # Create static library
 add_library(swiftimpute_lib STATIC
     ${CORE_SOURCES}
@@ -166,12 +174,17 @@ add_library(swiftimpute_lib STATIC
     ${API_SOURCES}
     ${VALIDATION_SOURCES}
     ${PHASING_SOURCES}
+    ${SPECIAL_SOURCES}
 )
+
+# Find threading library
+find_package(Threads REQUIRED)
 
 # Link CUDA libraries
 target_link_libraries(swiftimpute_lib
     CUDA::cudart
     CUDA::curand
+    Threads::Threads
 )
 
 # Link htslib if found

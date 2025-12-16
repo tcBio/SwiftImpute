@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <thread>
 #include <cuda_runtime.h>
 
 namespace swiftimpute {
@@ -1504,11 +1505,17 @@ MultiGPUImputer::MultiGPUImputer(
     config_(config),
     device_ids_(device_ids)
 {
+    LOG_INFO("Initializing MultiGPUImputer with " + std::to_string(device_ids.size()) + " GPUs");
+
     // Create imputer for each GPU
     for (int device_id : device_ids_) {
         ImputationConfig gpu_config = config;
         gpu_config.device_id = device_id;
         imputers_.push_back(std::make_unique<Imputer>(reference, gpu_config));
+
+        DeviceInfo info = get_device_info(device_id);
+        LOG_INFO("  GPU " + std::to_string(device_id) + ": " + info.name +
+                 " (" + std::to_string(info.total_memory / (1024*1024*1024)) + " GB)");
     }
 }
 
@@ -1517,19 +1524,125 @@ MultiGPUImputer::~MultiGPUImputer() {
 }
 
 void MultiGPUImputer::build_indices() {
-    for (auto& imputer : imputers_) {
-        try {
-            imputer->build_index();
-        } catch (const ImputationError&) {
-            LOG_WARNING("PBWT index not implemented yet");
+    LOG_INFO("Building PBWT indices on " + std::to_string(imputers_.size()) + " GPUs...");
+
+    // Build indices in parallel using threads
+    std::vector<std::thread> threads;
+    std::vector<std::exception_ptr> exceptions(imputers_.size());
+
+    for (size_t i = 0; i < imputers_.size(); ++i) {
+        threads.emplace_back([this, i, &exceptions]() {
+            try {
+                CHECK_CUDA(cudaSetDevice(device_ids_[i]));
+                imputers_[i]->build_index();
+                LOG_INFO("  PBWT index built on GPU " + std::to_string(device_ids_[i]));
+            } catch (...) {
+                exceptions[i] = std::current_exception();
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Check for exceptions
+    for (size_t i = 0; i < exceptions.size(); ++i) {
+        if (exceptions[i]) {
+            try {
+                std::rethrow_exception(exceptions[i]);
+            } catch (const ImputationError&) {
+                LOG_WARNING("PBWT index not implemented on GPU " + std::to_string(device_ids_[i]));
+            } catch (const std::exception& e) {
+                LOG_WARNING("Exception on GPU " + std::to_string(device_ids_[i]) + ": " + e.what());
+            }
         }
     }
 }
 
 std::unique_ptr<ImputationResult> MultiGPUImputer::impute(const TargetData& targets) {
-    // TODO: Implement multi-GPU load balancing
-    // For now, just use first GPU
-    return imputers_[0]->impute(targets);
+    uint32_t num_samples = targets.num_samples();
+    marker_t num_markers = targets.num_markers();
+
+    LOG_INFO("Multi-GPU imputation: " + std::to_string(num_samples) + " samples on " +
+             std::to_string(imputers_.size()) + " GPUs");
+
+    // Partition samples across GPUs
+    std::vector<uint32_t> start_indices, end_indices;
+    partition_samples(num_samples, start_indices, end_indices);
+
+    // Create result object
+    auto result = std::make_unique<ImputationResult>(num_samples, num_markers);
+
+    // Launch imputation on each GPU in parallel
+    std::vector<std::thread> threads;
+    std::vector<std::unique_ptr<ImputationResult>> partial_results(imputers_.size());
+    std::vector<std::exception_ptr> exceptions(imputers_.size());
+
+    for (size_t gpu_idx = 0; gpu_idx < imputers_.size(); ++gpu_idx) {
+        if (gpu_idx >= start_indices.size()) break;
+
+        uint32_t start = start_indices[gpu_idx];
+        uint32_t end = end_indices[gpu_idx];
+        uint32_t gpu_samples = end - start;
+
+        if (gpu_samples == 0) continue;
+
+        LOG_INFO("  GPU " + std::to_string(device_ids_[gpu_idx]) +
+                 ": samples " + std::to_string(start) + " to " + std::to_string(end));
+
+        threads.emplace_back([this, gpu_idx, start, end, &targets,
+                              &partial_results, &exceptions]() {
+            try {
+                CHECK_CUDA(cudaSetDevice(device_ids_[gpu_idx]));
+
+                // Create a view of target data for this GPU's samples
+                // For now, we process all and extract later
+                // TODO: Create proper target data slice
+
+                auto gpu_result = imputers_[gpu_idx]->impute(targets);
+                partial_results[gpu_idx] = std::move(gpu_result);
+
+            } catch (...) {
+                exceptions[gpu_idx] = std::current_exception();
+            }
+        });
+    }
+
+    // Wait for all GPUs to complete
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Check for exceptions
+    for (size_t i = 0; i < exceptions.size(); ++i) {
+        if (exceptions[i]) {
+            std::rethrow_exception(exceptions[i]);
+        }
+    }
+
+    // Merge results from all GPUs
+    LOG_INFO("Merging results from " + std::to_string(imputers_.size()) + " GPUs...");
+
+    for (size_t gpu_idx = 0; gpu_idx < imputers_.size(); ++gpu_idx) {
+        if (gpu_idx >= start_indices.size() || !partial_results[gpu_idx]) continue;
+
+        uint32_t start = start_indices[gpu_idx];
+        uint32_t end = end_indices[gpu_idx];
+
+        // Copy haplotypes from partial result
+        for (uint32_t s = start; s < end; ++s) {
+            result->set_haplotype(s, 0, partial_results[gpu_idx]->haplotype0(s));
+            result->set_haplotype(s, 1, partial_results[gpu_idx]->haplotype1(s));
+        }
+    }
+
+    // Compute INFO scores on merged result
+    result->compute_info_scores();
+
+    LOG_INFO("Multi-GPU imputation complete");
+
+    return result;
 }
 
 void MultiGPUImputer::partition_samples(
@@ -1537,20 +1650,52 @@ void MultiGPUImputer::partition_samples(
     std::vector<uint32_t>& start_indices,
     std::vector<uint32_t>& end_indices
 ) const {
-    // Simple even partitioning
-    uint32_t samples_per_gpu = (num_samples + imputers_.size() - 1) / imputers_.size();
-
     start_indices.clear();
     end_indices.clear();
 
-    for (size_t i = 0; i < imputers_.size(); ++i) {
-        uint32_t start = i * samples_per_gpu;
-        uint32_t end = std::min(start + samples_per_gpu, num_samples);
+    if (imputers_.empty() || num_samples == 0) {
+        return;
+    }
 
-        if (start < num_samples) {
-            start_indices.push_back(start);
-            end_indices.push_back(end);
+    // Get GPU memory information for load balancing
+    std::vector<size_t> gpu_memory(imputers_.size());
+    size_t total_memory = 0;
+
+    for (size_t i = 0; i < imputers_.size(); ++i) {
+        DeviceInfo info = get_device_info(device_ids_[i]);
+        gpu_memory[i] = info.free_memory;
+        total_memory += info.free_memory;
+    }
+
+    // Partition proportionally to available memory
+    uint32_t samples_assigned = 0;
+
+    for (size_t i = 0; i < imputers_.size(); ++i) {
+        double proportion = (total_memory > 0) ?
+            static_cast<double>(gpu_memory[i]) / total_memory : 1.0 / imputers_.size();
+
+        uint32_t gpu_samples = static_cast<uint32_t>(num_samples * proportion);
+
+        // Ensure at least some samples if GPU has memory
+        if (gpu_samples == 0 && gpu_memory[i] > 0 && samples_assigned < num_samples) {
+            gpu_samples = 1;
         }
+
+        // Don't exceed remaining samples
+        if (samples_assigned + gpu_samples > num_samples) {
+            gpu_samples = num_samples - samples_assigned;
+        }
+
+        if (gpu_samples > 0) {
+            start_indices.push_back(samples_assigned);
+            end_indices.push_back(samples_assigned + gpu_samples);
+            samples_assigned += gpu_samples;
+        }
+    }
+
+    // Assign any remaining samples to last GPU
+    if (samples_assigned < num_samples && !end_indices.empty()) {
+        end_indices.back() = num_samples;
     }
 }
 
