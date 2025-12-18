@@ -53,6 +53,106 @@ struct ImputationConfig {
         window_size(10000),         // Default: 10K markers per window
         window_overlap(100),        // Default: 100 marker overlap
         checkpoint_interval(0) {}
+
+    // ==========================================================================
+    // Configuration Presets
+    // ==========================================================================
+
+    /**
+     * @brief Preset for RAD-seq data imputation
+     *
+     * RAD-seq (Restriction-site Associated DNA sequencing) data has:
+     * - Sparse markers (non-uniform coverage across genome)
+     * - Higher missing data rates
+     * - Smaller sample sizes typically
+     * - Non-random marker distribution (clustered around restriction sites)
+     *
+     * This preset optimizes for:
+     * - More HMM states to capture distant haplotype relationships
+     * - Larger window overlap for better boundary handling
+     * - Higher Ne estimate for diverse/wild populations
+     */
+    static ImputationConfig radseq_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 16;      // More states for sparse markers
+        config.hmm_params.ne = 15000;           // Higher Ne for diverse populations
+        config.batch_size = 50;                 // Smaller batches for memory efficiency
+        config.window_size = 5000;              // Smaller windows (fewer markers)
+        config.window_overlap = 200;            // More overlap for sparse data
+        config.output_dosages = true;
+        config.output_probabilities = true;
+        config.output_info_score = true;
+        return config;
+    }
+
+    /**
+     * @brief Preset for small reference panels (< 1000 samples)
+     *
+     * Optimized for panels like the user's 300-sample Cannabis WGS reference
+     */
+    static ImputationConfig small_reference_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 12;      // Moderate states
+        config.hmm_params.ne = 10000;           // Standard Ne
+        config.batch_size = 100;
+        config.window_size = 20000;             // Larger windows OK with small ref
+        config.window_overlap = 150;
+        config.output_dosages = true;
+        config.output_probabilities = true;
+        config.output_info_score = true;
+        return config;
+    }
+
+    /**
+     * @brief Preset for large biobank-scale imputation
+     *
+     * Optimized for very large reference panels (UK Biobank, TOPMed)
+     */
+    static ImputationConfig biobank_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 8;       // Fewer states sufficient with large ref
+        config.hmm_params.ne = 20000;           // Higher Ne for admixed populations
+        config.batch_size = 200;                // Larger batches
+        config.window_size = 10000;
+        config.window_overlap = 100;
+        config.use_pinned_memory = true;
+        config.output_dosages = true;
+        config.output_probabilities = false;    // Save space
+        config.output_info_score = true;
+        return config;
+    }
+
+    /**
+     * @brief Preset for low-memory systems
+     */
+    static ImputationConfig low_memory_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 6;       // Minimum states
+        config.batch_size = 25;                 // Small batches
+        config.window_size = 5000;              // Small windows
+        config.window_overlap = 50;
+        config.use_pinned_memory = false;       // Save host memory
+        config.output_dosages = true;
+        config.output_probabilities = false;    // Save memory
+        config.output_info_score = true;
+        return config;
+    }
+
+    /**
+     * @brief Preset for maximum accuracy (slower)
+     */
+    static ImputationConfig high_accuracy_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 32;      // Maximum states
+        config.hmm_params.ne = 15000;
+        config.batch_size = 50;
+        config.window_size = 15000;
+        config.window_overlap = 300;            // Large overlap
+        config.output_dosages = true;
+        config.output_probabilities = true;
+        config.output_info_score = true;
+        return config;
+    }
 };
 
 // Reference panel data

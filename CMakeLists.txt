@@ -171,6 +171,14 @@ set(SPECIAL_SOURCES
     src/special/x_chromosome.cpp
 )
 
+# Analysis library
+set(ANALYSIS_SOURCES
+    src/analysis/marker_overlap.hpp
+    src/analysis/marker_overlap.cpp
+    src/analysis/qc_filter.hpp
+    src/analysis/qc_filter.cpp
+)
+
 # Create static library
 add_library(swiftimpute_lib STATIC
     ${CORE_SOURCES}
@@ -181,6 +189,7 @@ add_library(swiftimpute_lib STATIC
     ${VALIDATION_SOURCES}
     ${PHASING_SOURCES}
     ${SPECIAL_SOURCES}
+    ${ANALYSIS_SOURCES}
 )
 
 # Find threading library

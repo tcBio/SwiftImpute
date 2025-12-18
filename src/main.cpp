@@ -1,6 +1,8 @@
 #include "api/imputer.hpp"
 #include "core/types.hpp"
 #include "phasing/pre_phaser.hpp"
+#include "analysis/marker_overlap.hpp"
+#include "analysis/qc_filter.hpp"
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -24,6 +26,16 @@ struct CommandLineArgs {
     bool verbose = false;
     bool per_chromosome = false;      // Process each chromosome separately
     bool skip_prephase = false;       // Skip pre-phasing (assume input is phased)
+
+    // Configuration presets
+    std::string preset;               // radseq, small-ref, biobank, low-memory, high-accuracy
+
+    // Analysis options
+    bool analyze_overlap = false;     // Run marker overlap analysis
+    bool run_qc = false;              // Run QC filtering
+    double min_info_score = 0.8;      // Minimum INFO score for QC
+    std::string qc_output;            // QC report output file
+    bool interactive = false;         // Interactive mode with UI
 
     bool parse(int argc, char* argv[]) {
         for (int i = 1; i < argc; i++) {
@@ -57,9 +69,26 @@ struct CommandLineArgs {
                 verbose = true;
             } else if (arg == "--no-prephase" || arg == "--skip-prephase") {
                 skip_prephase = true;
+            } else if (arg == "--preset") {
+                if (++i < argc) preset = argv[i];
+            } else if (arg == "--analyze-overlap" || arg == "--overlap") {
+                analyze_overlap = true;
+            } else if (arg == "--qc" || arg == "--filter") {
+                run_qc = true;
+            } else if (arg == "--min-info") {
+                if (++i < argc) min_info_score = std::stod(argv[i]);
+            } else if (arg == "--qc-output") {
+                if (++i < argc) qc_output = argv[i];
+            } else if (arg == "--interactive" || arg == "-i") {
+                interactive = true;
             } else if (arg == "--help" || arg == "-h") {
                 return false;
             }
+        }
+
+        // For overlap-only analysis, we don't need output
+        if (analyze_overlap && output_vcf.empty() && !reference_vcf.empty() && !target_vcf.empty()) {
+            return true;
         }
 
         return !reference_vcf.empty() && !target_vcf.empty() && !output_vcf.empty();
@@ -85,13 +114,232 @@ struct CommandLineArgs {
         std::cout << "  --benchmark             Run in benchmark mode\n";
         std::cout << "  -v, --verbose           Verbose output\n";
         std::cout << "  -h, --help              Show this help message\n\n";
+        std::cout << "Configuration presets:\n";
+        std::cout << "  --preset NAME           Use preset configuration:\n";
+        std::cout << "                          - radseq: Optimized for RAD-seq data (sparse markers)\n";
+        std::cout << "                          - small-ref: For reference panels < 1000 samples\n";
+        std::cout << "                          - biobank: For large biobank-scale data\n";
+        std::cout << "                          - low-memory: Minimize memory usage\n";
+        std::cout << "                          - high-accuracy: Maximum accuracy (slower)\n\n";
+        std::cout << "Analysis options:\n";
+        std::cout << "  --overlap, --analyze-overlap\n";
+        std::cout << "                          Analyze marker overlap before imputation\n";
+        std::cout << "  --qc, --filter          Apply QC filtering to output\n";
+        std::cout << "  --min-info SCORE        Minimum INFO score for QC [default: 0.8]\n";
+        std::cout << "  --qc-output FILE        Write QC report to file\n";
+        std::cout << "  -i, --interactive       Interactive mode with analysis UI\n\n";
         std::cout << "Examples:\n";
-        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz\n";
-        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --chr chr22\n";
-        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --per-chromosome\n";
-        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --gpu 0 --states 16\n";
+        std::cout << "  # Basic imputation\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz\n\n";
+        std::cout << "  # RAD-seq data with overlap analysis\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t radseq.vcf.gz -o imputed.vcf.gz --preset radseq --overlap\n\n";
+        std::cout << "  # Imputation with QC filtering\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --qc --min-info 0.9\n\n";
+        std::cout << "  # Overlap analysis only (no imputation)\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz --overlap\n";
     }
 };
+
+// Helper function to apply preset configuration
+ImputationConfig apply_preset(const std::string& preset, const CommandLineArgs& args) {
+    ImputationConfig config;
+
+    if (preset == "radseq") {
+        config = ImputationConfig::radseq_preset();
+        LOG_INFO("Using RAD-seq preset configuration");
+    } else if (preset == "small-ref") {
+        config = ImputationConfig::small_reference_preset();
+        LOG_INFO("Using small reference panel preset");
+    } else if (preset == "biobank") {
+        config = ImputationConfig::biobank_preset();
+        LOG_INFO("Using biobank-scale preset");
+    } else if (preset == "low-memory") {
+        config = ImputationConfig::low_memory_preset();
+        LOG_INFO("Using low-memory preset");
+    } else if (preset == "high-accuracy") {
+        config = ImputationConfig::high_accuracy_preset();
+        LOG_INFO("Using high-accuracy preset");
+    } else if (!preset.empty()) {
+        LOG_WARNING("Unknown preset '" + preset + "', using default configuration");
+    }
+
+    // Override with explicit command-line arguments
+    config.device_id = args.device_id;
+    if (args.num_states != 8) {  // Non-default value specified
+        config.hmm_params.num_states = args.num_states;
+    }
+    if (args.ne != 10000) {  // Non-default value specified
+        config.hmm_params.ne = args.ne;
+    }
+    if (args.batch_size != 100) {  // Non-default value specified
+        config.batch_size = args.batch_size;
+    }
+    config.deterministic = args.deterministic;
+
+    return config;
+}
+
+// Interactive UI for overlap analysis
+void run_interactive_analysis(
+    const analysis::OverlapReport& report,
+    const CommandLineArgs& args
+) {
+    analysis::MarkerOverlapAnalyzer analyzer;
+
+    std::cout << "\n";
+    std::cout << "================================================================================\n";
+    std::cout << "              SwiftImpute - Interactive Analysis Mode\n";
+    std::cout << "================================================================================\n\n";
+
+    // Print summary
+    analyzer.print_report(report, std::cout);
+
+    // Print coverage visualization
+    analyzer.print_coverage_plot(report, std::cout);
+
+    // Interactive menu
+    bool running = true;
+    while (running) {
+        std::cout << "\n";
+        std::cout << "Options:\n";
+        std::cout << "  [1] Export report to JSON\n";
+        std::cout << "  [2] Export report to CSV\n";
+        std::cout << "  [3] Show detailed gap analysis\n";
+        std::cout << "  [4] Show recommended configuration\n";
+        std::cout << "  [5] Continue with imputation\n";
+        std::cout << "  [q] Quit\n";
+        std::cout << "\nChoice: ";
+
+        std::string choice;
+        std::getline(std::cin, choice);
+
+        if (choice == "1") {
+            std::string filename;
+            std::cout << "Enter JSON filename [overlap_report.json]: ";
+            std::getline(std::cin, filename);
+            if (filename.empty()) filename = "overlap_report.json";
+
+            try {
+                analyzer.export_json(report, filename);
+                std::cout << "Report exported to " << filename << "\n";
+            } catch (const std::exception& e) {
+                std::cout << "Error: " << e.what() << "\n";
+            }
+        }
+        else if (choice == "2") {
+            std::string filename;
+            std::cout << "Enter CSV filename [overlap_report.csv]: ";
+            std::getline(std::cin, filename);
+            if (filename.empty()) filename = "overlap_report.csv";
+
+            try {
+                analyzer.export_csv(report, filename);
+                std::cout << "Report exported to " << filename << "\n";
+            } catch (const std::exception& e) {
+                std::cout << "Error: " << e.what() << "\n";
+            }
+        }
+        else if (choice == "3") {
+            std::cout << "\nDetailed Gap Analysis:\n";
+            std::cout << "----------------------\n";
+
+            if (report.large_gaps.empty()) {
+                std::cout << "No large gaps detected (threshold: 100kb)\n";
+            } else {
+                std::cout << std::left << std::setw(12) << "Chromosome"
+                          << std::right << std::setw(15) << "Start"
+                          << std::setw(15) << "End"
+                          << std::setw(12) << "Size (kb)"
+                          << std::setw(12) << "Ref Avail\n";
+                std::cout << std::string(66, '-') << "\n";
+
+                for (const auto& gap : report.large_gaps) {
+                    std::cout << std::left << std::setw(12) << gap.chrom
+                              << std::right << std::setw(15) << gap.start
+                              << std::setw(15) << gap.end
+                              << std::setw(12) << (gap.length / 1000)
+                              << std::setw(12) << gap.ref_markers_in_gap << "\n";
+                }
+            }
+        }
+        else if (choice == "4") {
+            std::cout << "\nRecommended Configuration:\n";
+            std::cout << "--------------------------\n";
+
+            // Determine recommended preset
+            std::string rec_preset = "default";
+            double target_density = 0;
+            for (const auto& cs : report.by_chromosome) {
+                target_density += cs.target_marker_density();
+            }
+            if (!report.by_chromosome.empty()) {
+                target_density /= report.by_chromosome.size();
+            }
+
+            if (target_density < 100) {
+                rec_preset = "radseq";
+                std::cout << "Detected sparse target markers (RAD-seq-like)\n";
+            }
+            if (report.reference_samples < 500) {
+                rec_preset = "small-ref";
+                std::cout << "Detected small reference panel\n";
+            }
+
+            std::cout << "\nSuggested command:\n";
+            std::cout << "  swiftimpute -r " << report.reference_file
+                      << " -t " << report.target_file
+                      << " -o imputed.vcf.gz";
+            if (rec_preset != "default") {
+                std::cout << " --preset " << rec_preset;
+            }
+            std::cout << "\n";
+        }
+        else if (choice == "5") {
+            running = false;
+        }
+        else if (choice == "q" || choice == "Q") {
+            std::cout << "Exiting.\n";
+            exit(0);
+        }
+    }
+}
+
+// Run QC filtering after imputation
+void run_qc_filtering(
+    const std::string& imputed_vcf,
+    const std::string& output_vcf,
+    double min_info,
+    const std::string& qc_report_file,
+    bool verbose
+) {
+    LOG_INFO("Running QC filtering on " + imputed_vcf);
+
+    analysis::QCConfig qc_config;
+    qc_config.min_info_score = min_info;
+    qc_config.filter_by_info = true;
+
+    analysis::QCFilter filter(qc_config);
+
+    auto progress = [verbose](size_t completed, size_t total) {
+        if (verbose && completed % 50000 == 0) {
+            std::cout << "\rQC progress: " << completed << " variants" << std::flush;
+        }
+    };
+
+    auto summary = filter.filter_vcf(imputed_vcf, output_vcf, progress);
+
+    if (verbose) {
+        std::cout << "\n";
+        filter.print_summary(summary, std::cout);
+        filter.print_info_histogram(summary, std::cout);
+    }
+
+    // Export QC report if requested
+    if (!qc_report_file.empty()) {
+        filter.export_variant_qc(qc_report_file);
+        LOG_INFO("QC report written to " + qc_report_file);
+    }
+}
 
 // Helper function to process a single chromosome
 void process_chromosome(
@@ -197,6 +445,47 @@ int main(int argc, char* argv[]) {
         LOG_INFO("SwiftImpute - GPU-Accelerated Genomic Imputation");
         LOG_INFO("================================================");
 
+        // Run overlap analysis if requested (can run without loading full data)
+        if (args.analyze_overlap) {
+            LOG_INFO("Running marker overlap analysis...");
+            auto start_time = std::chrono::high_resolution_clock::now();
+
+            analysis::MarkerOverlapAnalyzer analyzer;
+            auto progress = args.verbose ?
+                [](size_t completed, size_t total, const std::string& stage) {
+                    std::cout << "\r" << stage << " (" << completed << "/" << total << ")" << std::flush;
+                } : analysis::ProgressCallback(nullptr);
+
+            auto overlap_report = analyzer.analyze_files(
+                args.reference_vcf, args.target_vcf, progress
+            );
+
+            if (args.verbose) {
+                std::cout << "\n";
+            }
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                end_time - start_time
+            ).count();
+            LOG_INFO("Overlap analysis completed in " + std::to_string(duration) + " ms");
+
+            // If interactive mode, show UI
+            if (args.interactive) {
+                run_interactive_analysis(overlap_report, args);
+            } else {
+                // Print summary
+                analyzer.print_report(overlap_report, std::cout);
+                analyzer.print_coverage_plot(overlap_report, std::cout);
+            }
+
+            // If no output specified, exit after analysis
+            if (args.output_vcf.empty()) {
+                LOG_INFO("Overlap analysis complete. No output file specified, exiting.");
+                return 0;
+            }
+        }
+
         // Load reference panel
         LOG_INFO("Loading reference panel: " + args.reference_vcf);
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -227,13 +516,8 @@ int main(int argc, char* argv[]) {
                  std::to_string(targets->num_markers()) + " markers in " +
                  std::to_string(load_duration) + " ms");
 
-        // Configure imputation
-        ImputationConfig config;
-        config.device_id = args.device_id;
-        config.hmm_params.num_states = args.num_states;
-        config.hmm_params.ne = args.ne;
-        config.batch_size = args.batch_size;
-        config.deterministic = args.deterministic;
+        // Configure imputation (using presets if specified)
+        ImputationConfig config = apply_preset(args.preset, args);
 
         // Select GPU
         if (config.device_id < 0) {
@@ -442,6 +726,28 @@ int main(int argc, char* argv[]) {
             ).count();
 
             LOG_INFO("Output written in " + std::to_string(write_duration) + " ms");
+        }
+
+        // Run QC filtering if requested
+        if (args.run_qc && !args.output_vcf.empty()) {
+            std::string qc_output = args.output_vcf;
+            // Generate QC'd filename: output.vcf.gz -> output.qc.vcf.gz
+            size_t ext_pos = qc_output.rfind(".vcf");
+            if (ext_pos != std::string::npos) {
+                qc_output = qc_output.substr(0, ext_pos) + ".qc" + qc_output.substr(ext_pos);
+            } else {
+                qc_output = qc_output + ".qc";
+            }
+
+            run_qc_filtering(
+                args.output_vcf,
+                qc_output,
+                args.min_info_score,
+                args.qc_output,
+                args.verbose
+            );
+
+            LOG_INFO("QC-filtered output: " + qc_output);
         }
 
         LOG_INFO("Done!");
