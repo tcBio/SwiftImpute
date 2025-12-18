@@ -2,6 +2,7 @@
 
 #include "../core/types.hpp"
 #include "../io/vcf_reader.hpp"
+#include "../io/mmap_reader.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -17,12 +18,46 @@ struct ChunkedLoadConfig {
     size_t max_memory_bytes;            // Max memory to use for reference data
     bool use_memory_mapping;            // Memory-map large files
     bool precompute_transitions;        // Precompute transitions during load
+    bool prefetch_next_chunk;           // Async prefetch next chunk during processing
+    MMapConfig mmap_config;             // Memory mapping configuration
 
     ChunkedLoadConfig() :
         max_markers_per_chunk(100000),  // 100K markers per chunk
         max_memory_bytes(8ULL * 1024 * 1024 * 1024),  // 8 GB default
         use_memory_mapping(true),
-        precompute_transitions(true) {}
+        precompute_transitions(true),
+        prefetch_next_chunk(true),
+        mmap_config() {}
+
+    // Preset for NVMe SSDs
+    static ChunkedLoadConfig nvme_optimized() {
+        ChunkedLoadConfig config;
+        config.use_memory_mapping = true;
+        config.prefetch_next_chunk = true;
+        config.mmap_config = MMapConfig::nvme_optimized();
+        return config;
+    }
+
+    // Preset for spinning disks
+    static ChunkedLoadConfig hdd_optimized() {
+        ChunkedLoadConfig config;
+        config.use_memory_mapping = true;
+        config.prefetch_next_chunk = false;  // Avoid seek overhead
+        config.max_markers_per_chunk = 200000;  // Larger chunks for sequential reads
+        config.mmap_config = MMapConfig::hdd_optimized();
+        return config;
+    }
+
+    // Preset for memory-constrained systems
+    static ChunkedLoadConfig low_memory() {
+        ChunkedLoadConfig config;
+        config.max_markers_per_chunk = 50000;
+        config.max_memory_bytes = 2ULL * 1024 * 1024 * 1024;  // 2 GB
+        config.use_memory_mapping = true;
+        config.prefetch_next_chunk = false;
+        config.mmap_config = MMapConfig::low_memory();
+        return config;
+    }
 };
 
 /**
@@ -34,13 +69,19 @@ struct ChunkLoadStats {
     size_t num_chunks;
     size_t peak_memory_bytes;
     double load_time_seconds;
+    bool used_memory_mapping;       // Whether mmap was used
+    bool is_nvme_storage;           // Whether storage is NVMe
+    double io_throughput_mbps;      // I/O throughput in MB/s
 
     ChunkLoadStats() :
         total_markers(0),
         total_haplotypes(0),
         num_chunks(0),
         peak_memory_bytes(0),
-        load_time_seconds(0) {}
+        load_time_seconds(0),
+        used_memory_mapping(false),
+        is_nvme_storage(false),
+        io_throughput_mbps(0) {}
 };
 
 /**
@@ -178,6 +219,36 @@ std::unique_ptr<StreamingReferenceLoader> create_optimal_loader(
     const std::string& filename,
     size_t available_gpu_memory,
     size_t available_host_memory
+);
+
+/**
+ * @brief Factory function with automatic storage detection
+ *
+ * Detects if file is on NVMe SSD and applies optimal configuration.
+ *
+ * @param filename VCF file path
+ * @param available_gpu_memory Available GPU memory in bytes
+ * @param available_host_memory Available host memory in bytes
+ * @return Configured streaming loader with optimal I/O settings
+ */
+std::unique_ptr<StreamingReferenceLoader> create_auto_optimized_loader(
+    const std::string& filename,
+    size_t available_gpu_memory,
+    size_t available_host_memory
+);
+
+/**
+ * @brief Benchmark I/O throughput for a file
+ *
+ * Useful for tuning chunk sizes and read-ahead settings.
+ *
+ * @param filename File to benchmark
+ * @param test_size_bytes Bytes to read for test (default 64MB)
+ * @return Measured throughput in MB/s
+ */
+double benchmark_io_throughput(
+    const std::string& filename,
+    size_t test_size_bytes = 64 * 1024 * 1024
 );
 
 } // namespace swiftimpute

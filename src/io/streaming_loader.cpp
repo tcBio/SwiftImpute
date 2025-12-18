@@ -267,7 +267,7 @@ std::unique_ptr<ReferenceChunk> ChunkIterator::next() {
     return nullptr;  // Would need proper implementation with loader access
 }
 
-// Factory function
+// Factory functions
 
 std::unique_ptr<StreamingReferenceLoader> create_optimal_loader(
     const std::string& filename,
@@ -301,6 +301,96 @@ std::unique_ptr<StreamingReferenceLoader> create_optimal_loader(
              " markers per chunk");
 
     return std::make_unique<StreamingReferenceLoader>(filename, config);
+}
+
+std::unique_ptr<StreamingReferenceLoader> create_auto_optimized_loader(
+    const std::string& filename,
+    size_t available_gpu_memory,
+    size_t available_host_memory
+) {
+    // Detect storage type and select optimal configuration
+    bool is_nvme = is_nvme_storage(filename);
+    MMapConfig mmap_config = detect_optimal_config(filename);
+
+    ChunkedLoadConfig config;
+    if (is_nvme) {
+        LOG_INFO("Detected NVMe storage - using optimized I/O settings");
+        config = ChunkedLoadConfig::nvme_optimized();
+        config.mmap_config = mmap_config;
+    } else {
+        LOG_INFO("Using standard I/O settings");
+        config.mmap_config = mmap_config;
+    }
+
+    // Get sample count for memory calculation
+    VCFReader quick_reader(filename);
+    auto header = quick_reader.read_header();
+    quick_reader.close();
+
+    haplotype_t num_haplotypes = static_cast<haplotype_t>(header.num_samples * 2);
+    size_t available = std::min(available_gpu_memory, available_host_memory);
+
+    config.max_markers_per_chunk = StreamingReferenceLoader::optimal_chunk_size(
+        num_haplotypes,
+        available
+    );
+
+    // Clamp to reasonable limits
+    config.max_markers_per_chunk = std::max(config.max_markers_per_chunk, size_t(10000));
+    config.max_markers_per_chunk = std::min(config.max_markers_per_chunk, size_t(1000000));
+
+    config.max_memory_bytes = available;
+
+    LOG_INFO("Created auto-optimized loader: " + std::to_string(config.max_markers_per_chunk) +
+             " markers per chunk, prefetch=" + (config.prefetch_next_chunk ? "on" : "off"));
+
+    return std::make_unique<StreamingReferenceLoader>(filename, config);
+}
+
+double benchmark_io_throughput(
+    const std::string& filename,
+    size_t test_size_bytes
+) {
+    try {
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        // Memory-map the file and read sequentially
+        MemoryMappedFile mmap_file(filename, MMapConfig::nvme_optimized());
+
+        if (!mmap_file.is_open()) {
+            return 0.0;
+        }
+
+        // Read up to test_size_bytes
+        size_t bytes_to_read = std::min(test_size_bytes, mmap_file.size());
+        const char* data = mmap_file.data();
+
+        // Touch each page to ensure data is read
+        volatile char sum = 0;
+        size_t page_size = MemoryMappedFile::page_size();
+        for (size_t i = 0; i < bytes_to_read; i += page_size) {
+            sum += data[i];
+        }
+        (void)sum;
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(end_time - start_time).count();
+
+        if (elapsed <= 0) {
+            return 0.0;
+        }
+
+        double throughput_mbps = (bytes_to_read / (1024.0 * 1024.0)) / elapsed;
+
+        LOG_INFO("I/O benchmark: " + std::to_string(bytes_to_read / (1024 * 1024)) +
+                 " MB in " + std::to_string(elapsed * 1000) + " ms = " +
+                 std::to_string(throughput_mbps) + " MB/s");
+
+        return throughput_mbps;
+    } catch (const std::exception& e) {
+        LOG_WARNING("I/O benchmark failed: " + std::string(e.what()));
+        return 0.0;
+    }
 }
 
 } // namespace swiftimpute

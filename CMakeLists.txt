@@ -116,6 +116,8 @@ set(PBWT_SOURCES
     src/pbwt/pbwt_index.hpp
     src/pbwt/pbwt_index.cpp
     src/pbwt/pbwt_selector.cu
+    src/pbwt/compact_pbwt.hpp
+    src/pbwt/compact_pbwt.cpp
 )
 
 # Kernel library
@@ -139,6 +141,10 @@ set(IO_SOURCES
     src/io/vcf_writer.hpp
     src/io/streaming_loader.hpp
     src/io/streaming_loader.cpp
+    src/io/compressed_vcf_writer.hpp
+    src/io/compressed_vcf_writer.cpp
+    src/io/mmap_reader.hpp
+    src/io/mmap_reader.cpp
 )
 
 # API library

@@ -6,6 +6,7 @@
  */
 
 #include "pbwt_index.hpp"
+#include "compact_pbwt.hpp"
 #include "core/types.hpp"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -527,6 +528,233 @@ size_t gpu_state_selector_memory_usage(
     size_t array_size = static_cast<size_t>(num_markers) * num_haplotypes;
     return array_size * sizeof(haplotype_t) +  // prefix
            array_size * sizeof(marker_t);       // divergence
+}
+
+// ============================================================================
+// Compact PBWT (16-bit) GPU Kernels
+// ============================================================================
+
+/**
+ * Compact kernel: Select top-L states using 16-bit indices
+ *
+ * Memory bandwidth is reduced by 50% compared to standard 32-bit version.
+ * Each thread processes one marker.
+ */
+__global__ void select_states_compact_kernel(
+    const compact_haplotype_t* __restrict__ d_prefix,    // [num_markers][num_haplotypes]
+    const compact_marker_t* __restrict__ d_divergence,   // [num_markers][num_haplotypes]
+    uint32_t num_markers,
+    uint32_t num_haplotypes,
+    uint32_t num_states_L,
+    haplotype_t* __restrict__ d_selected_states          // Output: [num_samples][num_markers][L]
+) {
+    uint32_t sample = blockIdx.x;
+    uint32_t marker_base = blockIdx.y * blockDim.x;
+    uint32_t local_marker = threadIdx.x;
+    uint32_t marker = marker_base + local_marker;
+
+    if (marker >= num_markers) return;
+
+    // Each thread processes one marker
+    const compact_haplotype_t* prefix_row = d_prefix + static_cast<size_t>(marker) * num_haplotypes;
+    const compact_marker_t* divergence_row = d_divergence + static_cast<size_t>(marker) * num_haplotypes;
+
+    // Use local memory for top-L selection
+    compact_marker_t top_div[64];      // Support up to L=64
+    compact_haplotype_t top_hap[64];
+    uint32_t top_count = 0;
+
+    // Simple linear scan with insertion sort for top-L
+    for (uint32_t i = 0; i < num_haplotypes; ++i) {
+        compact_haplotype_t hap = prefix_row[i];
+        compact_marker_t div = divergence_row[i];
+
+        if (top_count < num_states_L) {
+            // Insert maintaining sorted order (descending by divergence)
+            uint32_t pos = top_count;
+            for (uint32_t j = 0; j < top_count; ++j) {
+                if (div > top_div[j]) {
+                    pos = j;
+                    break;
+                }
+            }
+            for (uint32_t j = top_count; j > pos; --j) {
+                top_div[j] = top_div[j-1];
+                top_hap[j] = top_hap[j-1];
+            }
+            top_div[pos] = div;
+            top_hap[pos] = hap;
+            top_count++;
+        } else if (div > top_div[num_states_L - 1]) {
+            // Better than worst, insert
+            uint32_t pos = num_states_L - 1;
+            for (uint32_t j = 0; j < num_states_L - 1; ++j) {
+                if (div > top_div[j]) {
+                    pos = j;
+                    break;
+                }
+            }
+            for (uint32_t j = num_states_L - 1; j > pos; --j) {
+                top_div[j] = top_div[j-1];
+                top_hap[j] = top_hap[j-1];
+            }
+            top_div[pos] = div;
+            top_hap[pos] = hap;
+        }
+    }
+
+    // Write output (convert 16-bit to 32-bit)
+    haplotype_t* output = d_selected_states +
+        (static_cast<size_t>(sample) * num_markers + marker) * num_states_L;
+
+    for (uint32_t i = 0; i < num_states_L; ++i) {
+        if (i < top_count) {
+            output[i] = static_cast<haplotype_t>(top_hap[i]);
+        } else {
+            output[i] = i % num_haplotypes;
+        }
+    }
+}
+
+/**
+ * Warp-based compact kernel for small L values
+ */
+__global__ void select_states_compact_warp_kernel(
+    const compact_haplotype_t* __restrict__ d_prefix,
+    const compact_marker_t* __restrict__ d_divergence,
+    uint32_t num_markers,
+    uint32_t num_haplotypes,
+    uint32_t num_states_L,
+    uint32_t num_samples,
+    haplotype_t* __restrict__ d_selected_states
+) {
+    uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t warp_id = global_tid / WARP_SIZE;
+    uint32_t lane = global_tid % WARP_SIZE;
+
+    uint32_t total_pairs = num_markers * num_samples;
+    if (warp_id >= total_pairs) return;
+
+    uint32_t sample = warp_id / num_markers;
+    uint32_t marker = warp_id % num_markers;
+
+    const compact_haplotype_t* prefix_row = d_prefix + static_cast<size_t>(marker) * num_haplotypes;
+    const compact_marker_t* divergence_row = d_divergence + static_cast<size_t>(marker) * num_haplotypes;
+
+    // Each lane maintains local top candidates (16-bit)
+    compact_marker_t local_best_div[4] = {0, 0, 0, 0};
+    compact_haplotype_t local_best_hap[4] = {0, 0, 0, 0};
+    uint32_t local_count = 0;
+
+    // Process haplotypes in strided fashion
+    for (uint32_t i = lane; i < num_haplotypes; i += WARP_SIZE) {
+        compact_haplotype_t hap = prefix_row[i];
+        compact_marker_t div = divergence_row[i];
+
+        // Update local top-4
+        for (uint32_t j = 0; j < 4; ++j) {
+            if (local_count <= j || div > local_best_div[j]) {
+                for (uint32_t k = 3; k > j; --k) {
+                    local_best_div[k] = local_best_div[k-1];
+                    local_best_hap[k] = local_best_hap[k-1];
+                }
+                local_best_div[j] = div;
+                local_best_hap[j] = hap;
+                local_count = min(local_count + 1, 4u);
+                break;
+            }
+        }
+    }
+
+    // Output pointer
+    haplotype_t* output = d_selected_states +
+        (static_cast<size_t>(sample) * num_markers + marker) * num_states_L;
+
+    // Warp reduction to find global top-L
+    for (uint32_t out_idx = 0; out_idx < num_states_L && out_idx < local_count; ++out_idx) {
+        compact_marker_t my_div = (out_idx < local_count) ? local_best_div[out_idx] : 0;
+        compact_haplotype_t my_hap = (out_idx < local_count) ? local_best_hap[out_idx] : 0;
+
+        // Warp-level max reduction (use 32-bit for shuffle)
+        uint32_t max_div = static_cast<uint32_t>(my_div);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            uint32_t other_div = __shfl_down_sync(0xFFFFFFFF, max_div, offset);
+            max_div = max(max_div, other_div);
+        }
+        max_div = __shfl_sync(0xFFFFFFFF, max_div, 0);
+
+        // Find winner lane
+        uint32_t winner_mask = __ballot_sync(0xFFFFFFFF, static_cast<uint32_t>(my_div) == max_div);
+        uint32_t winner_lane = __ffs(winner_mask) - 1;
+
+        // Broadcast winner's haplotype (convert to 32-bit for shuffle)
+        uint32_t winner_hap_32 = __shfl_sync(0xFFFFFFFF, static_cast<uint32_t>(my_hap), winner_lane);
+
+        if (lane == 0) {
+            output[out_idx] = static_cast<haplotype_t>(winner_hap_32);
+        }
+
+        // Mark winner's entry as used
+        if (lane == winner_lane) {
+            local_best_div[out_idx] = 0;
+        }
+    }
+
+    // Fill remaining slots
+    if (lane == 0) {
+        for (uint32_t i = local_count; i < num_states_L; ++i) {
+            output[i] = i % num_haplotypes;
+        }
+    }
+}
+
+void launch_select_states_compact(
+    const compact_haplotype_t* d_prefix,
+    const compact_marker_t* d_divergence,
+    const allele_t* d_target_haplotypes,  // Can be nullptr
+    uint32_t num_samples,
+    uint32_t num_markers,
+    uint32_t num_haplotypes,
+    uint32_t num_states_L,
+    haplotype_t* d_selected_states,
+    cudaStream_t stream
+) {
+    // Choose kernel based on L value
+    if (num_states_L <= 32 && num_haplotypes <= 10000) {
+        // Use warp-based kernel for small L
+        uint32_t total_pairs = num_markers * num_samples;
+        uint32_t warps_per_block = THREADS_PER_BLOCK / WARP_SIZE;
+        uint32_t num_blocks = (total_pairs + warps_per_block - 1) / warps_per_block;
+
+        select_states_compact_warp_kernel<<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+            d_prefix,
+            d_divergence,
+            num_markers,
+            num_haplotypes,
+            num_states_L,
+            num_samples,
+            d_selected_states
+        );
+    } else {
+        // Use block-based kernel - one thread per marker
+        dim3 grid(num_samples, (num_markers + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        dim3 block(THREADS_PER_BLOCK);
+
+        select_states_compact_kernel<<<grid, block, 0, stream>>>(
+            d_prefix,
+            d_divergence,
+            num_markers,
+            num_haplotypes,
+            num_states_L,
+            d_selected_states
+        );
+    }
+
+    // Check for errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw CUDAError("launch_select_states_compact failed", static_cast<int>(err));
+    }
 }
 
 } // namespace pbwt
