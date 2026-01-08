@@ -132,7 +132,9 @@ struct CommandLineArgs {
         std::cout << "                          - radseq: Optimized for RAD-seq data (sparse markers)\n";
         std::cout << "                          - small-ref: For reference panels < 1000 samples\n";
         std::cout << "                          - biobank: For large biobank-scale data\n";
-        std::cout << "                          - low-memory: Minimize memory usage\n";
+        std::cout << "                          - low-memory: Minimize memory usage (~4-6 GB GPU)\n";
+        std::cout << "                          - minimum-memory: Minimal GPU usage (~2-4 GB GPU)\n";
+        std::cout << "                          - streaming: Ultra-low memory (~2 GB GPU)\n";
         std::cout << "                          - high-accuracy: Maximum accuracy (slower)\n\n";
         std::cout << "Analysis options:\n";
         std::cout << "  --overlap, --analyze-overlap\n";
@@ -176,6 +178,12 @@ ImputationConfig apply_preset(const std::string& preset, const CommandLineArgs& 
     } else if (preset == "high-accuracy") {
         config = ImputationConfig::high_accuracy_preset();
         LOG_INFO("Using high-accuracy preset");
+    } else if (preset == "minimum-memory") {
+        config = ImputationConfig::minimum_memory_preset();
+        LOG_INFO("Using minimum-memory preset (for 2-4 GB GPUs)");
+    } else if (preset == "streaming") {
+        config = ImputationConfig::streaming_preset();
+        LOG_INFO("Using streaming preset (for ~2 GB GPUs)");
     } else if (!preset.empty()) {
         LOG_WARNING("Unknown preset '" + preset + "', using default configuration");
     }

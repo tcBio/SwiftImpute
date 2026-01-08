@@ -123,18 +123,64 @@ struct ImputationConfig {
     }
 
     /**
-     * @brief Preset for low-memory systems
+     * @brief Preset for low-memory systems (4-6 GB GPU)
      */
     static ImputationConfig low_memory_preset() {
         ImputationConfig config;
-        config.hmm_params.num_states = 6;       // Minimum states
+        config.hmm_params.num_states = 6;       // Fewer states = less memory
         config.batch_size = 25;                 // Small batches
         config.window_size = 5000;              // Small windows
         config.window_overlap = 50;
-        config.use_pinned_memory = false;       // Save host memory
+        config.use_pinned_memory = false;       // Disable async pipeline
         config.output_dosages = true;
         config.output_probabilities = false;    // Save memory
         config.output_info_score = true;
+        return config;
+    }
+
+    /**
+     * @brief Preset for minimum memory systems (2-4 GB GPU, e.g., GTX 1650)
+     *
+     * Memory-critical settings for running on consumer GPUs with limited VRAM.
+     * Trades speed for lower memory usage by:
+     * - Using minimum HMM states (4)
+     * - Very small batch sizes
+     * - Disabling async transfers (saves ~2/3 of buffer memory)
+     * - Small processing windows
+     *
+     * Expected memory usage: ~1-2 GB for moderate datasets
+     */
+    static ImputationConfig minimum_memory_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 4;       // Minimum practical states
+        config.batch_size = 10;                 // Very small batches
+        config.window_size = 2000;              // Very small windows
+        config.window_overlap = 25;
+        config.use_pinned_memory = false;       // No async = much less memory
+        config.output_dosages = true;
+        config.output_probabilities = false;    // Don't output GP field
+        config.output_info_score = true;
+        config.deterministic = true;            // Argmax instead of sampling (no RNG states)
+        return config;
+    }
+
+    /**
+     * @brief Preset for streaming mode on memory-constrained systems
+     *
+     * Processes data in very small chunks with minimal GPU memory.
+     * Suitable for systems with only 2 GB VRAM.
+     */
+    static ImputationConfig streaming_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 4;
+        config.batch_size = 5;                  // Process 5 samples at a time
+        config.window_size = 1000;              // Very small windows
+        config.window_overlap = 20;
+        config.use_pinned_memory = false;
+        config.output_dosages = true;
+        config.output_probabilities = false;
+        config.output_info_score = false;       // Compute on CPU instead
+        config.deterministic = true;
         return config;
     }
 

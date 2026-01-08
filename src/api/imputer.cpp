@@ -1787,22 +1787,77 @@ size_t Imputer::estimate_memory_requirement(
     uint32_t num_target_samples,
     const ImputationConfig& config
 ) {
-    // Rough estimate of GPU memory required
+    /*
+     * Detailed GPU memory estimation
+     *
+     * Memory is dominated by:
+     * 1. Fixed costs (reference, PBWT, transition matrices)
+     * 2. Per-batch costs (scales with batch_size × markers × states)
+     * 3. Async pipeline costs (3× some buffers if use_pinned_memory=true)
+     */
+
+    marker_t M = reference.num_markers();
+    haplotype_t H = reference.num_haplotypes();
+    uint32_t L = config.hmm_params.num_states;
+    uint32_t B = config.batch_size;
+    uint32_t checkpoint_interval = static_cast<uint32_t>(std::sqrt(static_cast<float>(M)));
+    uint32_t num_checkpoints = (M + checkpoint_interval - 1) / checkpoint_interval;
 
     size_t total = 0;
 
-    // Reference haplotypes
-    total += static_cast<size_t>(reference.num_markers()) * reference.num_haplotypes();
+    // ===== FIXED COSTS =====
 
-    // PBWT index (approximate)
-    total += static_cast<size_t>(reference.num_markers()) * reference.num_haplotypes() * 4;
+    // Reference panel on GPU (stored twice: EmissionComputer + HaplotypeSampler)
+    size_t reference_size = static_cast<size_t>(M) * H * sizeof(allele_t);
+    total += reference_size * 2;
 
-    // Per-batch memory
-    uint32_t batch_size = config.batch_size;
-    size_t batch_memory = static_cast<size_t>(reference.num_markers()) * batch_size *
-                          config.hmm_params.num_states * sizeof(prob_t) * 2;
+    // PBWT index (prefix + divergence arrays)
+    size_t pbwt_size = static_cast<size_t>(M) * H * (sizeof(haplotype_t) + sizeof(marker_t));
+    total += pbwt_size;
 
-    total += batch_memory;
+    // Transition matrices: (M-1) × L × L
+    size_t transition_size = static_cast<size_t>(M - 1) * L * L * sizeof(prob_t);
+    total += transition_size;
+
+    // Genetic distances
+    total += M * sizeof(double);
+
+    // ===== PER-BATCH COSTS =====
+
+    // Genotype likelihoods: B × M × sizeof(GenotypeLikelihoods)
+    size_t gl_size = static_cast<size_t>(B) * M * sizeof(GenotypeLikelihoods);
+    total += gl_size;
+
+    // Selected states: B × M × L × 2 × sizeof(haplotype_t)
+    size_t states_size = static_cast<size_t>(B) * M * L * 2 * sizeof(haplotype_t);
+    total += states_size;
+
+    // Emission probabilities: B × M × L
+    size_t emission_size = static_cast<size_t>(B) * M * L * sizeof(prob_t);
+    total += emission_size;
+
+    // Posterior probabilities: B × M × L
+    size_t posterior_size = static_cast<size_t>(B) * M * L * sizeof(prob_t);
+    total += posterior_size;
+
+    // Forward checkpoints: B × num_checkpoints × L
+    size_t checkpoint_size = static_cast<size_t>(B) * num_checkpoints * L * sizeof(prob_t);
+    total += checkpoint_size;
+
+    // Scaling factors: B × M
+    size_t scaling_size = static_cast<size_t>(B) * M * sizeof(prob_t);
+    total += scaling_size;
+
+    // Output haplotypes: B × 2 × M
+    size_t output_size = static_cast<size_t>(B) * 2 * M * sizeof(allele_t);
+    total += output_size;
+
+    // ===== ASYNC PIPELINE COSTS =====
+    // Triple buffering adds 3× for some buffers
+    if (config.use_pinned_memory) {
+        size_t async_per_stream = gl_size + states_size + output_size;
+        total += async_per_stream * 3;  // 3 streams
+    }
 
     return total;
 }
