@@ -111,7 +111,32 @@ public:
         haplotype_t num_haplotypes,
         bool parallel = true
     );
-    
+
+    /**
+     * @brief Build PBWT index for a range of markers (windowed build)
+     *
+     * This enables memory-efficient imputation of large reference panels by
+     * building the PBWT index for a window of markers rather than all markers.
+     *
+     * Memory savings: (end - start) / total_markers ratio
+     *
+     * @param reference_panel Reference haplotypes [total_markers][num_haplotypes]
+     * @param total_markers Total markers in reference panel
+     * @param start_marker First marker to include in window
+     * @param end_marker One past last marker (exclusive)
+     * @param num_haplotypes Number of haplotypes
+     * @param parallel Use parallel construction
+     * @return PBWT index for the specified marker range
+     */
+    static std::unique_ptr<PBWTIndex> build_range(
+        const allele_t* reference_panel,
+        marker_t total_markers,
+        marker_t start_marker,
+        marker_t end_marker,
+        haplotype_t num_haplotypes,
+        bool parallel = true
+    );
+
 private:
     // Build single marker's prefix and divergence arrays
     static void build_marker(

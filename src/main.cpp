@@ -50,6 +50,11 @@ struct CommandLineArgs {
     std::string genetic_map_dir;      // Directory with per-chromosome map files
     std::string map_format;           // Map file format (auto, plink, hapmap, shapeit, beagle)
 
+    // Memory optimization options
+    bool rebuild_pbwt = false;        // Rebuild PBWT per window
+    uint32_t pbwt_chunk_size = 0;     // PBWT chunk size (0 = use window_size)
+    uint32_t window_size = 0;         // Override window size (0 = use preset)
+
     bool parse(int argc, char* argv[]) {
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
@@ -106,6 +111,12 @@ struct CommandLineArgs {
                 if (++i < argc) genetic_map_dir = argv[i];
             } else if (arg == "--map-format") {
                 if (++i < argc) map_format = argv[i];
+            } else if (arg == "--rebuild-pbwt" || arg == "--rebuild-pbwt-per-window") {
+                rebuild_pbwt = true;
+            } else if (arg == "--pbwt-chunk-size") {
+                if (++i < argc) pbwt_chunk_size = std::stoul(argv[i]);
+            } else if (arg == "--window-size") {
+                if (++i < argc) window_size = std::stoul(argv[i]);
             } else if (arg == "--help" || arg == "-h") {
                 return false;
             }
@@ -147,7 +158,12 @@ struct CommandLineArgs {
         std::cout << "                          - low-memory: Minimize memory usage (~4-6 GB GPU)\n";
         std::cout << "                          - minimum-memory: Minimal GPU usage (~2-4 GB GPU)\n";
         std::cout << "                          - streaming: Ultra-low memory (~2 GB GPU)\n";
-        std::cout << "                          - high-accuracy: Maximum accuracy (slower)\n\n";
+        std::cout << "                          - high-accuracy: Maximum accuracy (slower)\n";
+        std::cout << "                          - large-panel: For >2000 sample ref panels (1000G)\n\n";
+        std::cout << "Memory optimization:\n";
+        std::cout << "  --rebuild-pbwt          Rebuild PBWT index per window (saves memory)\n";
+        std::cout << "  --pbwt-chunk-size N     Markers per PBWT chunk [default: window_size]\n";
+        std::cout << "  --window-size N         Override window size for HMM processing\n\n";
         std::cout << "Analysis options:\n";
         std::cout << "  --overlap, --analyze-overlap\n";
         std::cout << "                          Analyze marker overlap before imputation\n";
@@ -204,6 +220,9 @@ ImputationConfig apply_preset(const std::string& preset, const CommandLineArgs& 
     } else if (preset == "streaming") {
         config = ImputationConfig::streaming_preset();
         LOG_INFO("Using streaming preset (for ~2 GB GPUs)");
+    } else if (preset == "large-panel") {
+        config = ImputationConfig::large_panel_preset();
+        LOG_INFO("Using large-panel preset (rebuilds PBWT per window)");
     } else if (!preset.empty()) {
         LOG_WARNING("Unknown preset '" + preset + "', using default configuration");
     }
@@ -220,6 +239,22 @@ ImputationConfig apply_preset(const std::string& preset, const CommandLineArgs& 
         config.batch_size = args.batch_size;
     }
     config.deterministic = args.deterministic;
+
+    // Memory optimization overrides
+    if (args.rebuild_pbwt) {
+        config.rebuild_pbwt_per_window = true;
+        LOG_INFO("PBWT index will be rebuilt per window (memory optimization)");
+    }
+    if (args.pbwt_chunk_size > 0) {
+        config.pbwt_chunk_size = args.pbwt_chunk_size;
+    }
+    if (args.window_size > 0) {
+        config.window_size = args.window_size;
+        // If rebuilding PBWT and no explicit chunk size, match window
+        if (config.rebuild_pbwt_per_window && args.pbwt_chunk_size == 0) {
+            config.pbwt_chunk_size = args.window_size;
+        }
+    }
 
     return config;
 }

@@ -38,6 +38,10 @@ struct ImputationConfig {
     uint32_t window_size;           // Markers per window (0 = no windowing, process all at once)
     uint32_t window_overlap;        // Overlap between windows for boundary smoothing
 
+    // Memory optimization for large reference panels
+    bool rebuild_pbwt_per_window;   // Rebuild PBWT index for each window (reduces memory by ~M/W ratio)
+    uint32_t pbwt_chunk_size;       // Markers per PBWT chunk (0 = use window_size)
+
     // Checkpointing
     uint32_t checkpoint_interval;   // 0 = auto-calculate based on window_size
 
@@ -52,6 +56,8 @@ struct ImputationConfig {
         deterministic(false),
         window_size(10000),         // Default: 10K markers per window
         window_overlap(100),        // Default: 100 marker overlap
+        rebuild_pbwt_per_window(false),  // Default: build full PBWT once
+        pbwt_chunk_size(0),         // Default: use window_size
         checkpoint_interval(0) {}
 
     // ==========================================================================
@@ -196,6 +202,34 @@ struct ImputationConfig {
         config.window_overlap = 300;            // Large overlap
         config.output_dosages = true;
         config.output_probabilities = true;
+        config.output_info_score = true;
+        return config;
+    }
+
+    /**
+     * @brief Preset for large reference panels (>2000 samples, e.g., 1000 Genomes)
+     *
+     * Optimized for panels with many haplotypes where the PBWT index would
+     * exceed GPU memory. Rebuilds PBWT per window to trade compute for memory.
+     *
+     * Memory reduction: M/W ratio (e.g., 3.4M/200K = 17× less PBWT memory)
+     * Time overhead: ~2-3× slower due to PBWT rebuilding
+     *
+     * PBWT memory per window: W × H × 8 bytes
+     * Example: 200K markers × 5008 haplotypes × 8 = 8 GB per window
+     */
+    static ImputationConfig large_panel_preset() {
+        ImputationConfig config;
+        config.hmm_params.num_states = 8;       // Standard states
+        config.hmm_params.ne = 15000;           // Typical for diverse panels
+        config.batch_size = 50;                 // Moderate batches
+        config.window_size = 200000;            // 200K marker windows
+        config.window_overlap = 2000;           // Good overlap for large windows
+        config.rebuild_pbwt_per_window = true;  // KEY: rebuild PBWT per window
+        config.pbwt_chunk_size = 200000;        // Match window size
+        config.use_pinned_memory = false;       // Save memory
+        config.output_dosages = true;
+        config.output_probabilities = false;    // Save output space
         config.output_info_score = true;
         return config;
     }

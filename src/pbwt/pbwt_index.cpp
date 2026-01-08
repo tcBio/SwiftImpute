@@ -153,6 +153,89 @@ std::unique_ptr<PBWTIndex> PBWTBuilder::build(
     return index;
 }
 
+std::unique_ptr<PBWTIndex> PBWTBuilder::build_range(
+    const allele_t* reference_panel,
+    marker_t total_markers,
+    marker_t start_marker,
+    marker_t end_marker,
+    haplotype_t num_haplotypes,
+    bool parallel
+) {
+    // Validate range
+    if (start_marker >= total_markers || end_marker > total_markers || start_marker >= end_marker) {
+        throw std::invalid_argument("Invalid marker range for PBWT build");
+    }
+
+    marker_t window_markers = end_marker - start_marker;
+
+    LOG_INFO("Building windowed PBWT index: markers " + std::to_string(start_marker) +
+             "-" + std::to_string(end_marker) + " (" + std::to_string(window_markers) +
+             " markers, " + std::to_string(num_haplotypes) + " haplotypes)");
+
+    auto index = std::make_unique<PBWTIndex>();
+    index->num_markers_ = window_markers;
+    index->num_haplotypes_ = num_haplotypes;
+
+    // Allocate arrays for the window only
+    index->prefix_.num_markers = window_markers;
+    index->prefix_.num_haplotypes = num_haplotypes;
+    index->prefix_.data.resize(static_cast<size_t>(window_markers) * num_haplotypes);
+
+    index->divergence_.num_markers = window_markers;
+    index->divergence_.num_haplotypes = num_haplotypes;
+    index->divergence_.data.resize(static_cast<size_t>(window_markers) * num_haplotypes);
+
+    // Working buffers
+    std::vector<haplotype_t> prev_prefix(num_haplotypes);
+    std::vector<marker_t> prev_divergence(num_haplotypes, 0);
+    std::vector<haplotype_t> curr_prefix(num_haplotypes);
+    std::vector<marker_t> curr_divergence(num_haplotypes);
+
+    // Initialize prefix array (identity permutation)
+    std::iota(prev_prefix.begin(), prev_prefix.end(), 0);
+    std::fill(prev_divergence.begin(), prev_divergence.end(), 0);
+
+    // Pre-process markers before the window to get correct starting state
+    // This is necessary for PBWT correctness - we need the prefix/divergence
+    // state at start_marker, which depends on all previous markers
+    for (marker_t m = 0; m < start_marker; ++m) {
+        build_marker(m, reference_panel, num_haplotypes,
+                    prev_prefix.data(), prev_divergence.data(),
+                    curr_prefix.data(), curr_divergence.data());
+        std::swap(prev_prefix, curr_prefix);
+        std::swap(prev_divergence, curr_divergence);
+    }
+
+    // Build PBWT for the window markers
+    for (marker_t m = start_marker; m < end_marker; ++m) {
+        build_marker(m, reference_panel, num_haplotypes,
+                    prev_prefix.data(), prev_divergence.data(),
+                    curr_prefix.data(), curr_divergence.data());
+
+        // Store in index (using window-relative index)
+        marker_t window_idx = m - start_marker;
+        for (haplotype_t h = 0; h < num_haplotypes; ++h) {
+            index->prefix_.set(window_idx, h, curr_prefix[h]);
+            // Adjust divergence values to be relative to window start
+            marker_t div = curr_divergence[h];
+            if (div < start_marker) {
+                div = 0;  // Clamp to window start
+            } else {
+                div = div - start_marker;
+            }
+            index->divergence_.set(window_idx, h, div);
+        }
+
+        std::swap(prev_prefix, curr_prefix);
+        std::swap(prev_divergence, curr_divergence);
+    }
+
+    LOG_INFO("Windowed PBWT index built successfully (" +
+             std::to_string(index->memory_usage() / (1024*1024)) + " MB)");
+
+    return index;
+}
+
 void PBWTBuilder::build_marker(
     marker_t m,
     const allele_t* reference_panel,

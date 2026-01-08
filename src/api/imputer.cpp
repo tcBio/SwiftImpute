@@ -1066,6 +1066,17 @@ void Imputer::free_async_buffers() {
 }
 
 void Imputer::build_index() {
+    // If rebuild_pbwt_per_window is enabled, skip building full PBWT index
+    // It will be built per-window during state selection instead
+    if (config_.rebuild_pbwt_per_window) {
+        uint32_t chunk_size = config_.pbwt_chunk_size > 0 ? config_.pbwt_chunk_size : config_.window_size;
+        size_t estimated_memory = static_cast<size_t>(chunk_size) * reference_.num_haplotypes() * 8;
+        LOG_INFO("PBWT index will be rebuilt per window (" + std::to_string(chunk_size) +
+                 " markers/window, ~" + std::to_string(estimated_memory / (1024*1024)) + " MB per window)");
+        LOG_INFO("Memory savings: ~" + std::to_string(reference_.num_markers() / chunk_size) + "× reduction");
+        return;
+    }
+
     LOG_INFO("Building PBWT index...");
 
     // Build PBWT index from reference panel
@@ -1300,6 +1311,53 @@ void Imputer::impute_batch(
                     LOG_INFO("CPU state selection: sample " + std::to_string(batch_s + 1) + "/" +
                              std::to_string(batch_size));
                 }
+            }
+        } else if (config_.rebuild_pbwt_per_window && config_.hmm_params.use_pbwt_selection) {
+            // Chunked PBWT: build index per window for memory efficiency
+            uint32_t chunk_size = config_.pbwt_chunk_size > 0 ? config_.pbwt_chunk_size : config_.window_size;
+            if (chunk_size == 0) chunk_size = 10000;  // Default chunk size
+
+            uint32_t num_chunks = (num_markers + chunk_size - 1) / chunk_size;
+            LOG_INFO("Using chunked PBWT state selection (" + std::to_string(num_chunks) +
+                     " chunks of " + std::to_string(chunk_size) + " markers)");
+
+            for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
+                marker_t chunk_start = chunk * chunk_size;
+                marker_t chunk_end = std::min(chunk_start + chunk_size, num_markers);
+                marker_t chunk_markers = chunk_end - chunk_start;
+
+                // Build PBWT for this chunk
+                auto chunk_pbwt = pbwt::PBWTBuilder::build_range(
+                    reference_.haplotypes(),
+                    reference_.num_markers(),
+                    chunk_start,
+                    chunk_end,
+                    reference_.num_haplotypes(),
+                    true  // parallel
+                );
+
+                // Select states for markers in this chunk
+                for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
+                    for (marker_t m = chunk_start; m < chunk_end; ++m) {
+                        std::vector<haplotype_t> best_states(num_states);
+
+                        // Use window-relative index for PBWT query
+                        marker_t window_m = m - chunk_start;
+                        chunk_pbwt->select_states(window_m, nullptr, num_states, best_states.data());
+
+                        uint64_t base = (static_cast<uint64_t>(batch_s) * num_markers + m) * num_states * 2;
+
+                        for (uint32_t k = 0; k < num_states; ++k) {
+                            haplotype_t hap_idx = best_states[k];
+                            h_selected_states[base + k * 2 + 0] = hap_idx;
+                            h_selected_states[base + k * 2 + 1] = (hap_idx + 1) % reference_.num_haplotypes();
+                        }
+                    }
+                }
+
+                // PBWT for this chunk is automatically freed when chunk_pbwt goes out of scope
+                LOG_INFO("Chunk " + std::to_string(chunk + 1) + "/" + std::to_string(num_chunks) +
+                         " complete (markers " + std::to_string(chunk_start) + "-" + std::to_string(chunk_end) + ")");
             }
         } else {
             // Fallback: simple selection using first L haplotypes
@@ -1840,7 +1898,15 @@ size_t Imputer::estimate_memory_requirement(
     total += reference_size * 2;
 
     // PBWT index (prefix + divergence arrays)
-    size_t pbwt_size = static_cast<size_t>(M) * H * (sizeof(haplotype_t) + sizeof(marker_t));
+    // If rebuild_pbwt_per_window is enabled, only need chunk_size worth of PBWT
+    size_t pbwt_markers = M;
+    if (config.rebuild_pbwt_per_window) {
+        uint32_t chunk_size = config.pbwt_chunk_size > 0 ? config.pbwt_chunk_size : config.window_size;
+        if (chunk_size > 0 && chunk_size < M) {
+            pbwt_markers = chunk_size;
+        }
+    }
+    size_t pbwt_size = static_cast<size_t>(pbwt_markers) * H * (sizeof(haplotype_t) + sizeof(marker_t));
     total += pbwt_size;
 
     // Transition matrices: (M-1) × L × L
