@@ -147,6 +147,8 @@ set(IO_SOURCES
     src/io/mmap_reader.cpp
     src/io/parallel_vcf_loader.hpp
     src/io/parallel_vcf_loader.cpp
+    src/io/genetic_map.hpp
+    src/io/genetic_map.cpp
 )
 
 # API library

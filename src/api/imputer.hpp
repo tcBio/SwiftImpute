@@ -240,7 +240,10 @@ public:
 
     // Filter to specific chromosome
     std::unique_ptr<ReferencePanel> filter_chromosome(const std::string& chrom) const;
-    
+
+    // Apply genetic map to update cM positions
+    void apply_genetic_map(const std::vector<double>& genetic_positions);
+
 private:
     std::vector<Marker> markers_;
     std::vector<Sample> samples_;
@@ -288,6 +291,9 @@ public:
 
     // Filter to specific chromosome
     std::unique_ptr<TargetData> filter_chromosome(const std::string& chrom) const;
+
+    // Apply genetic map to update cM positions
+    void apply_genetic_map(const std::vector<double>& genetic_positions);
 
 private:
     std::vector<Marker> markers_;

@@ -289,6 +289,20 @@ std::unique_ptr<ReferencePanel> ReferencePanel::filter_chromosome(const std::str
     ));
 }
 
+void ReferencePanel::apply_genetic_map(const std::vector<double>& genetic_positions) {
+    if (genetic_positions.size() != markers_.size()) {
+        throw ImputationError("Genetic map size mismatch: " +
+            std::to_string(genetic_positions.size()) + " positions for " +
+            std::to_string(markers_.size()) + " markers");
+    }
+
+    for (size_t i = 0; i < markers_.size(); ++i) {
+        markers_[i].cM = genetic_positions[i];
+    }
+
+    LOG_INFO("Applied genetic map to " + std::to_string(markers_.size()) + " reference markers");
+}
+
 // TargetData implementation
 
 TargetData::TargetData(
@@ -555,6 +569,20 @@ std::unique_ptr<TargetData> TargetData::filter_chromosome(const std::string& chr
         std::move(filtered_samples),
         std::move(filtered_liks)
     ));
+}
+
+void TargetData::apply_genetic_map(const std::vector<double>& genetic_positions) {
+    if (genetic_positions.size() != markers_.size()) {
+        throw ImputationError("Genetic map size mismatch: " +
+            std::to_string(genetic_positions.size()) + " positions for " +
+            std::to_string(markers_.size()) + " markers");
+    }
+
+    for (size_t i = 0; i < markers_.size(); ++i) {
+        markers_[i].cM = genetic_positions[i];
+    }
+
+    LOG_INFO("Applied genetic map to " + std::to_string(markers_.size()) + " target markers");
 }
 
 // ImputationResult implementation

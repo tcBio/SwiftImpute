@@ -5,6 +5,7 @@
 #include "analysis/marker_overlap.hpp"
 #include "analysis/qc_filter.hpp"
 #include "io/parallel_vcf_loader.hpp"
+#include "io/genetic_map.hpp"
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -43,6 +44,11 @@ struct CommandLineArgs {
     bool gpu_phasing = true;          // Use GPU for phasing (default: on)
     bool parallel_load = true;        // Use parallel VCF loading (default: on)
     uint32_t load_threads = 0;        // Threads for loading (0 = auto)
+
+    // Genetic map options
+    std::string genetic_map_file;     // Path to genetic map file
+    std::string genetic_map_dir;      // Directory with per-chromosome map files
+    std::string map_format;           // Map file format (auto, plink, hapmap, shapeit, beagle)
 
     bool parse(int argc, char* argv[]) {
         for (int i = 1; i < argc; i++) {
@@ -94,6 +100,12 @@ struct CommandLineArgs {
                 parallel_load = false;
             } else if (arg == "--load-threads") {
                 if (++i < argc) load_threads = std::stoul(argv[i]);
+            } else if (arg == "--map" || arg == "--genetic-map") {
+                if (++i < argc) genetic_map_file = argv[i];
+            } else if (arg == "--map-dir" || arg == "--genetic-map-dir") {
+                if (++i < argc) genetic_map_dir = argv[i];
+            } else if (arg == "--map-format") {
+                if (++i < argc) map_format = argv[i];
             } else if (arg == "--help" || arg == "-h") {
                 return false;
             }
@@ -147,6 +159,12 @@ struct CommandLineArgs {
         std::cout << "  --no-gpu-phasing        Use CPU phasing instead of GPU [default: GPU]\n";
         std::cout << "  --no-parallel-load      Disable parallel VCF loading [default: parallel]\n";
         std::cout << "  --load-threads N        Number of threads for loading [default: auto]\n\n";
+        std::cout << "Genetic map options:\n";
+        std::cout << "  --map, --genetic-map FILE\n";
+        std::cout << "                          Genetic recombination map file\n";
+        std::cout << "  --map-dir DIR           Directory with per-chromosome map files\n";
+        std::cout << "  --map-format FORMAT     Map file format: auto, plink, hapmap, shapeit, beagle\n";
+        std::cout << "                          [default: auto-detect]\n\n";
         std::cout << "Examples:\n";
         std::cout << "  # Basic imputation\n";
         std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz\n\n";
@@ -155,7 +173,9 @@ struct CommandLineArgs {
         std::cout << "  # Imputation with QC filtering\n";
         std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --qc --min-info 0.9\n\n";
         std::cout << "  # Overlap analysis only (no imputation)\n";
-        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz --overlap\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz --overlap\n\n";
+        std::cout << "  # With genetic recombination map for improved accuracy\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --map genetic_map.txt\n";
     }
 };
 
@@ -202,6 +222,45 @@ ImputationConfig apply_preset(const std::string& preset, const CommandLineArgs& 
     config.deterministic = args.deterministic;
 
     return config;
+}
+
+// Helper function to parse genetic map format string
+io::GeneticMapFormat parse_map_format(const std::string& format_str) {
+    if (format_str.empty() || format_str == "auto") {
+        return io::GeneticMapFormat::AUTO;
+    } else if (format_str == "plink") {
+        return io::GeneticMapFormat::PLINK;
+    } else if (format_str == "hapmap") {
+        return io::GeneticMapFormat::HAPMAP;
+    } else if (format_str == "shapeit") {
+        return io::GeneticMapFormat::SHAPEIT;
+    } else if (format_str == "beagle") {
+        return io::GeneticMapFormat::BEAGLE;
+    } else {
+        LOG_WARNING("Unknown map format '" + format_str + "', using auto-detection");
+        return io::GeneticMapFormat::AUTO;
+    }
+}
+
+// Helper function to load genetic map from args
+std::unique_ptr<io::GeneticMap> load_genetic_map_from_args(const CommandLineArgs& args) {
+    if (args.genetic_map_file.empty() && args.genetic_map_dir.empty()) {
+        return nullptr;
+    }
+
+    auto genetic_map = std::make_unique<io::GeneticMap>();
+    io::GeneticMapFormat format = parse_map_format(args.map_format);
+
+    if (!args.genetic_map_file.empty()) {
+        genetic_map->load(args.genetic_map_file, format);
+    } else if (!args.genetic_map_dir.empty()) {
+        genetic_map->load_directory(args.genetic_map_dir, format);
+    }
+
+    LOG_INFO("Loaded genetic map with " + std::to_string(genetic_map->total_entries()) +
+             " entries across " + std::to_string(genetic_map->chromosomes().size()) + " chromosomes");
+
+    return genetic_map;
 }
 
 // Interactive UI for overlap analysis
@@ -540,6 +599,30 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Loaded " + std::to_string(targets->num_samples()) + " samples, " +
                  std::to_string(targets->num_markers()) + " markers in " +
                  std::to_string(load_duration) + " ms");
+
+        // Load and apply genetic map if specified
+        std::unique_ptr<io::GeneticMap> genetic_map = load_genetic_map_from_args(args);
+        if (genetic_map && genetic_map->is_loaded()) {
+            LOG_INFO("Applying genetic map to reference panel...");
+
+            // Get genetic positions for reference markers
+            std::vector<double> ref_positions;
+            ref_positions.reserve(reference->num_markers());
+            for (const auto& marker : reference->markers()) {
+                ref_positions.push_back(genetic_map->interpolate(marker.chrom, marker.pos));
+            }
+            reference->apply_genetic_map(ref_positions);
+
+            // Get genetic positions for target markers
+            std::vector<double> target_positions;
+            target_positions.reserve(targets->num_markers());
+            for (const auto& marker : targets->markers()) {
+                target_positions.push_back(genetic_map->interpolate(marker.chrom, marker.pos));
+            }
+            targets->apply_genetic_map(target_positions);
+
+            LOG_INFO("Genetic map applied successfully");
+        }
 
         // Configure imputation (using presets if specified)
         ImputationConfig config = apply_preset(args.preset, args);
