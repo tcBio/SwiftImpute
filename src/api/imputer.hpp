@@ -377,6 +377,23 @@ private:
     int device_id_;
     cudaStream_t stream_;
 
+    // Multiple streams for async transfer overlap (triple buffering)
+    static constexpr int NUM_ASYNC_STREAMS = 3;
+    cudaStream_t async_streams_[NUM_ASYNC_STREAMS];
+    cudaEvent_t batch_complete_events_[NUM_ASYNC_STREAMS];
+
+    // Triple buffer pointers for async pipelining
+    struct AsyncBuffer {
+        GenotypeLikelihoods* d_genotype_liks;
+        haplotype_t* d_selected_states;
+        allele_t* d_output_haplotypes;
+        GenotypeLikelihoods* h_pinned_liks;
+        haplotype_t* h_pinned_states;
+        allele_t* h_pinned_output;
+    };
+    AsyncBuffer async_buffers_[NUM_ASYNC_STREAMS];
+    bool async_buffers_allocated_;
+
     void initialize_gpu();
     void initialize_gpu_kernels();
     void allocate_batch_memory(uint32_t batch_size);
@@ -390,12 +407,26 @@ private:
         ImputationResult& result
     );
 
+    // Async pipelined batch processing (overlaps CPU/GPU work)
+    void impute_batch_async(
+        const TargetData& targets,
+        uint32_t start_sample,
+        uint32_t end_sample,
+        ImputationResult& result
+    );
+
     // Windowed forward-backward for large datasets
     void run_windowed_forward_backward(
         uint32_t batch_size,
         uint32_t num_markers,
         uint32_t num_states
     );
+
+    // Async buffer management
+    void allocate_async_buffers(uint32_t batch_size);
+    void free_async_buffers();
+    void initialize_async_streams();
+    void destroy_async_streams();
 };
 
 // Convenience function for simple use case

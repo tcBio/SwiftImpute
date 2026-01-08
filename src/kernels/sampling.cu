@@ -319,6 +319,60 @@ void HaplotypeSampler::sample(
     CHECK_CUDA(cudaStreamSynchronize(stream_));
 }
 
+void HaplotypeSampler::sample_async(
+    const prob_t* d_posteriors,
+    const haplotype_t* d_selected_states,
+    allele_t* d_output_haplotypes,
+    uint32_t num_samples,
+    bool deterministic,
+    cudaStream_t stream
+) {
+    CHECK_CUDA(cudaSetDevice(device_id_));
+
+    if (d_reference_haplotypes_ == nullptr) {
+        throw std::runtime_error("Reference panel not set. Call set_reference_panel() first.");
+    }
+
+    // Launch configuration
+    int block_size = 256;
+    int grid_size = (num_samples + block_size - 1) / block_size;
+
+    if (deterministic) {
+        // Deterministic sampling (argmax)
+        sample_haplotypes_deterministic_kernel<<<grid_size, block_size, 0, stream>>>(
+            d_posteriors,
+            d_selected_states,
+            d_reference_haplotypes_,
+            d_output_haplotypes,
+            num_samples,
+            num_markers_,
+            num_haplotypes_,
+            num_states_
+        );
+    } else {
+        // Stochastic sampling
+        if (!rng_initialized_ || rng_num_samples_ != num_samples) {
+            // Initialize RNG with default seed if not already done
+            initialize_rng(num_samples, 12345ULL);
+        }
+
+        sample_haplotypes_stochastic_kernel<<<grid_size, block_size, 0, stream>>>(
+            d_posteriors,
+            d_selected_states,
+            d_reference_haplotypes_,
+            d_output_haplotypes,
+            d_rng_states_,
+            num_samples,
+            num_markers_,
+            num_haplotypes_,
+            num_states_
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    // Note: No synchronization - caller must sync the stream if needed
+}
+
 size_t HaplotypeSampler::memory_usage() const {
     size_t total = 0;
 

@@ -257,10 +257,33 @@ void TransitionComputer::compute(bool use_shared_memory) {
     // Grid: one block per marker transition
     dim3 grid(num_markers_ - 1);
 
-    // Block: num_states × num_states threads
-    dim3 block(num_states_, num_states_);
+    // CRITICAL FIX: Block size cannot exceed 1024 threads total
+    // For num_states > 32, we need a different approach
+    uint32_t max_threads_per_dim = std::min(num_states_, 32u);
+    uint32_t total_threads = max_threads_per_dim * max_threads_per_dim;
 
-    if (use_shared_memory && num_states_ <= 16) {
+    // Ensure we don't exceed 1024 threads per block
+    if (total_threads > 1024) {
+        max_threads_per_dim = 32;  // 32x32 = 1024
+    }
+
+    dim3 block(max_threads_per_dim, max_threads_per_dim);
+
+    // For larger state counts, use multiple blocks per marker
+    if (num_states_ > 32) {
+        // Use 2D grid: x = markers, y = state blocks
+        uint32_t state_blocks_per_marker = (num_states_ + max_threads_per_dim - 1) / max_threads_per_dim;
+        dim3 grid2d(num_markers_ - 1, state_blocks_per_marker * state_blocks_per_marker);
+
+        // Use grid-stride kernel (handles large state counts)
+        compute_transition_probs_kernel<<<grid2d, block, 0, stream_>>>(
+            d_genetic_distances_,
+            params_,
+            d_transition_matrices_,
+            num_markers_,
+            num_states_
+        );
+    } else if (use_shared_memory && num_states_ <= 16) {
         // Use shared memory version for small state counts (≤16 states = 256 threads)
         size_t shared_mem_size = num_states_ * num_states_ * sizeof(prob_t);
 
@@ -272,7 +295,7 @@ void TransitionComputer::compute(bool use_shared_memory) {
             num_states_
         );
     } else {
-        // Use standard version
+        // Use standard version for moderate state counts (≤32)
         compute_transition_probs_kernel<<<grid, block, 0, stream_>>>(
             d_genetic_distances_,
             params_,

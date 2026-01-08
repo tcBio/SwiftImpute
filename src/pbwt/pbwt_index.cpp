@@ -3,6 +3,9 @@
 #include <numeric>
 #include <vector>
 #include <queue>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace swiftimpute {
 namespace pbwt {
@@ -214,8 +217,13 @@ void PBWTBuilder::build_parallel(
     PrefixArray& prefix,
     DivergenceArray& divergence
 ) {
-    // For now, just call sequential version
-    // TODO: Implement parallel version with thread pool
+    // PBWT building is inherently sequential marker-by-marker
+    // but we can parallelize the copy operations and use optimized memory access
+
+#ifdef _OPENMP
+    int num_threads = omp_get_max_threads();
+    LOG_INFO("Building PBWT with " + std::to_string(num_threads) + " OpenMP threads");
+#endif
 
     std::vector<haplotype_t> prev_prefix(num_haplotypes);
     std::vector<marker_t> prev_divergence(num_haplotypes, 0);
@@ -231,9 +239,21 @@ void PBWTBuilder::build_parallel(
                     prev_prefix.data(), prev_divergence.data(),
                     curr_prefix.data(), curr_divergence.data());
 
-        for (haplotype_t h = 0; h < num_haplotypes; ++h) {
-            prefix.set(m, h, curr_prefix[h]);
-            divergence.set(m, h, curr_divergence[h]);
+        // Parallelize the copy to output arrays for large haplotype counts
+#ifdef _OPENMP
+        if (num_haplotypes > 1000) {
+            #pragma omp parallel for simd
+            for (haplotype_t h = 0; h < num_haplotypes; ++h) {
+                prefix.set(m, h, curr_prefix[h]);
+                divergence.set(m, h, curr_divergence[h]);
+            }
+        } else
+#endif
+        {
+            for (haplotype_t h = 0; h < num_haplotypes; ++h) {
+                prefix.set(m, h, curr_prefix[h]);
+                divergence.set(m, h, curr_divergence[h]);
+            }
         }
 
         std::swap(prev_prefix, curr_prefix);
@@ -270,9 +290,10 @@ void StateSelector::select_for_batch(
     marker_t num_markers,
     marker_t* selected_states
 ) const {
-    // Process each sample sequentially
-    // TODO: Parallelize with OpenMP or thread pool
-
+    // Process each sample in parallel using OpenMP
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1)
+#endif
     for (uint32_t s = 0; s < num_samples; ++s) {
         const allele_t* sample_haps = &target_haplotypes[s * 2 * num_markers];
         marker_t* sample_states = &selected_states[s * num_markers * num_states_];

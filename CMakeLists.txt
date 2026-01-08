@@ -199,12 +199,25 @@ add_library(swiftimpute_lib STATIC
 # Find threading library
 find_package(Threads REQUIRED)
 
+# Find OpenMP for CPU parallelization
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found: version ${OpenMP_CXX_VERSION}")
+else()
+    message(STATUS "OpenMP not found - CPU parallelization will be limited")
+endif()
+
 # Link CUDA libraries
 target_link_libraries(swiftimpute_lib
     CUDA::cudart
     CUDA::curand
     Threads::Threads
 )
+
+# Link OpenMP if found
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(swiftimpute_lib OpenMP::OpenMP_CXX)
+endif()
 
 # Link htslib if found
 if(HTSLIB_FOUND)
@@ -304,6 +317,11 @@ message(STATUS "  CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "  Fast math: ${USE_FAST_MATH}")
 message(STATUS "  Build tests: ${BUILD_TESTS}")
 message(STATUS "  Build benchmarks: ${BUILD_BENCHMARKS}")
+if(OpenMP_CXX_FOUND)
+    message(STATUS "  OpenMP support: ENABLED (${OpenMP_CXX_VERSION})")
+else()
+    message(STATUS "  OpenMP support: NOT FOUND")
+endif()
 if(ENABLE_HTSLIB)
     if(HTSLIB_FOUND)
         message(STATUS "  htslib support: ENABLED (${HTSLIB_LIBRARIES})")

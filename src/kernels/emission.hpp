@@ -87,6 +87,20 @@ public:
     );
 
     /**
+     * Compute emission probabilities (async version with custom stream)
+     *
+     * Same as compute() but uses the specified CUDA stream for async execution.
+     */
+    void compute_async(
+        const GenotypeLikelihoods* d_genotype_liks,
+        const haplotype_t* d_selected_states,
+        prob_t* d_emission_probs,
+        uint32_t num_samples,
+        bool use_shared_memory,
+        cudaStream_t stream
+    );
+
+    /**
      * Get GPU memory usage in bytes
      */
     size_t memory_usage() const;

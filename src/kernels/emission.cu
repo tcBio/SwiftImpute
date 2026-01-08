@@ -256,6 +256,58 @@ void EmissionComputer::compute(
     CHECK_CUDA(cudaStreamSynchronize(stream_));
 }
 
+void EmissionComputer::compute_async(
+    const GenotypeLikelihoods* d_genotype_liks,
+    const haplotype_t* d_selected_states,
+    prob_t* d_emission_probs,
+    uint32_t num_samples,
+    bool use_shared_memory,
+    cudaStream_t stream
+) {
+    CHECK_CUDA(cudaSetDevice(device_id_));
+
+    if (d_reference_haplotypes_ == nullptr) {
+        throw std::runtime_error("Reference panel not set. Call set_reference_panel() first.");
+    }
+
+    // Grid dimensions: one block per (sample, marker) pair
+    dim3 grid(num_samples, num_markers_);
+
+    // Block dimensions: one thread per state
+    dim3 block(num_states_);
+
+    if (use_shared_memory && num_states_ <= 32) {
+        // Use shared memory version for small state counts
+        size_t shared_mem_size = num_states_ * 2 * sizeof(haplotype_t);
+
+        compute_emission_probs_kernel_shared<<<grid, block, shared_mem_size, stream>>>(
+            d_genotype_liks,
+            d_reference_haplotypes_,
+            d_selected_states,
+            d_emission_probs,
+            num_samples,
+            num_markers_,
+            num_haplotypes_,
+            num_states_
+        );
+    } else {
+        // Use standard version
+        compute_emission_probs_kernel<<<grid, block, 0, stream>>>(
+            d_genotype_liks,
+            d_reference_haplotypes_,
+            d_selected_states,
+            d_emission_probs,
+            num_samples,
+            num_markers_,
+            num_haplotypes_,
+            num_states_
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    // Note: No synchronization - caller must sync the stream if needed
+}
+
 size_t EmissionComputer::memory_usage() const {
     size_t reference_size = static_cast<size_t>(num_markers_) * num_haplotypes_ * sizeof(allele_t);
     return reference_size;

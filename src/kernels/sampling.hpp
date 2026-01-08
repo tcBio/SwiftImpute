@@ -93,6 +93,20 @@ public:
     );
 
     /**
+     * Sample haplotypes (async version with custom stream)
+     *
+     * Same as sample() but uses the specified CUDA stream for async execution.
+     */
+    void sample_async(
+        const prob_t* d_posteriors,
+        const haplotype_t* d_selected_states,
+        allele_t* d_output_haplotypes,
+        uint32_t num_samples,
+        bool deterministic,
+        cudaStream_t stream
+    );
+
+    /**
      * Get GPU memory usage in bytes
      */
     size_t memory_usage() const;
