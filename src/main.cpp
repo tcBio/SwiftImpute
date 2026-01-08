@@ -1,8 +1,10 @@
 #include "api/imputer.hpp"
 #include "core/types.hpp"
 #include "phasing/pre_phaser.hpp"
+#include "phasing/gpu_phaser.cuh"
 #include "analysis/marker_overlap.hpp"
 #include "analysis/qc_filter.hpp"
+#include "io/parallel_vcf_loader.hpp"
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -36,6 +38,11 @@ struct CommandLineArgs {
     double min_info_score = 0.8;      // Minimum INFO score for QC
     std::string qc_output;            // QC report output file
     bool interactive = false;         // Interactive mode with UI
+
+    // GPU acceleration options
+    bool gpu_phasing = true;          // Use GPU for phasing (default: on)
+    bool parallel_load = true;        // Use parallel VCF loading (default: on)
+    uint32_t load_threads = 0;        // Threads for loading (0 = auto)
 
     bool parse(int argc, char* argv[]) {
         for (int i = 1; i < argc; i++) {
@@ -81,6 +88,12 @@ struct CommandLineArgs {
                 if (++i < argc) qc_output = argv[i];
             } else if (arg == "--interactive" || arg == "-i") {
                 interactive = true;
+            } else if (arg == "--no-gpu-phasing" || arg == "--cpu-phasing") {
+                gpu_phasing = false;
+            } else if (arg == "--no-parallel-load") {
+                parallel_load = false;
+            } else if (arg == "--load-threads") {
+                if (++i < argc) load_threads = std::stoul(argv[i]);
             } else if (arg == "--help" || arg == "-h") {
                 return false;
             }
@@ -128,6 +141,10 @@ struct CommandLineArgs {
         std::cout << "  --min-info SCORE        Minimum INFO score for QC [default: 0.8]\n";
         std::cout << "  --qc-output FILE        Write QC report to file\n";
         std::cout << "  -i, --interactive       Interactive mode with analysis UI\n\n";
+        std::cout << "Performance options:\n";
+        std::cout << "  --no-gpu-phasing        Use CPU phasing instead of GPU [default: GPU]\n";
+        std::cout << "  --no-parallel-load      Disable parallel VCF loading [default: parallel]\n";
+        std::cout << "  --load-threads N        Number of threads for loading [default: auto]\n\n";
         std::cout << "Examples:\n";
         std::cout << "  # Basic imputation\n";
         std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz\n\n";

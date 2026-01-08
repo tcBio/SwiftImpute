@@ -145,6 +145,8 @@ set(IO_SOURCES
     src/io/compressed_vcf_writer.cpp
     src/io/mmap_reader.hpp
     src/io/mmap_reader.cpp
+    src/io/parallel_vcf_loader.hpp
+    src/io/parallel_vcf_loader.cpp
 )
 
 # API library
@@ -163,6 +165,8 @@ set(VALIDATION_SOURCES
 set(PHASING_SOURCES
     src/phasing/pre_phaser.hpp
     src/phasing/pre_phaser.cpp
+    src/phasing/gpu_phaser.cuh
+    src/phasing/gpu_phaser.cu
 )
 
 # Special handling (X chromosome, etc.)
