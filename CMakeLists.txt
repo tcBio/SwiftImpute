@@ -149,12 +149,16 @@ set(IO_SOURCES
     src/io/parallel_vcf_loader.cpp
     src/io/genetic_map.hpp
     src/io/genetic_map.cpp
+    src/io/binary_format.hpp
+    src/io/binary_format.cpp
 )
 
 # API library
 set(API_SOURCES
     src/api/imputer.hpp
     src/api/imputer.cpp
+    src/api/checkpoint.hpp
+    src/api/checkpoint.cpp
 )
 
 # Validation library

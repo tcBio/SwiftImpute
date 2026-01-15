@@ -548,5 +548,204 @@ size_t GPUStateSelector::device_memory_usage() const {
     return gpu_state_selector_memory_usage(index_.num_markers(), index_.num_haplotypes());
 }
 
+// =============================================================================
+// PBWT Index Save/Load Functions
+// =============================================================================
+
+void save_pbwt_index(const PBWTIndex& index, const std::string& filename) {
+    LOG_INFO("Saving PBWT index to: " + filename);
+
+    std::ofstream file(filename, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Cannot open file for writing: " + filename);
+    }
+
+    // Magic number and version
+    uint32_t magic = 0x50575753;  // "SWWP" - SwiftImpute PBWT
+    uint32_t version = 1;
+    file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+
+    // Dimensions
+    marker_t num_markers = index.num_markers();
+    haplotype_t num_haplotypes = index.num_haplotypes();
+    file.write(reinterpret_cast<const char*>(&num_markers), sizeof(num_markers));
+    file.write(reinterpret_cast<const char*>(&num_haplotypes), sizeof(num_haplotypes));
+
+    // Data type sizes (for cross-compilation safety)
+    uint32_t hap_size = sizeof(haplotype_t);
+    uint32_t marker_size = sizeof(marker_t);
+    file.write(reinterpret_cast<const char*>(&hap_size), sizeof(hap_size));
+    file.write(reinterpret_cast<const char*>(&marker_size), sizeof(marker_size));
+
+    // Calculate total entries
+    size_t total_entries = static_cast<size_t>(num_markers) * num_haplotypes;
+
+    // Write prefix array
+    file.write(reinterpret_cast<const char*>(index.prefix().data.data()),
+               total_entries * sizeof(haplotype_t));
+
+    // Write divergence array
+    file.write(reinterpret_cast<const char*>(index.divergence().data.data()),
+               total_entries * sizeof(marker_t));
+
+    file.close();
+
+    // Report size
+    size_t file_size = total_entries * (sizeof(haplotype_t) + sizeof(marker_t)) + 24;  // header
+    LOG_INFO("Saved PBWT index: " + std::to_string(file_size / 1024 / 1024) + " MB " +
+             "(" + std::to_string(num_markers) + " markers x " +
+             std::to_string(num_haplotypes) + " haplotypes)");
+}
+
+std::unique_ptr<PBWTIndex> load_pbwt_index(const std::string& filename) {
+    LOG_INFO("Loading PBWT index from: " + filename);
+
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Cannot open PBWT index file: " + filename);
+    }
+
+    // Read and validate magic number
+    uint32_t magic, version;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+
+    if (magic != 0x50575753) {
+        throw std::runtime_error("Invalid PBWT index file: bad magic number");
+    }
+
+    if (version > 1) {
+        throw std::runtime_error("PBWT index file version not supported: " + std::to_string(version));
+    }
+
+    // Read dimensions
+    marker_t num_markers;
+    haplotype_t num_haplotypes;
+    file.read(reinterpret_cast<char*>(&num_markers), sizeof(num_markers));
+    file.read(reinterpret_cast<char*>(&num_haplotypes), sizeof(num_haplotypes));
+
+    // Read and validate type sizes
+    uint32_t hap_size, marker_size;
+    file.read(reinterpret_cast<char*>(&hap_size), sizeof(hap_size));
+    file.read(reinterpret_cast<char*>(&marker_size), sizeof(marker_size));
+
+    if (hap_size != sizeof(haplotype_t) || marker_size != sizeof(marker_t)) {
+        throw std::runtime_error("PBWT index was built with different type sizes");
+    }
+
+    // Create index
+    auto index = std::make_unique<PBWTIndex>();
+    index->num_markers_ = num_markers;
+    index->num_haplotypes_ = num_haplotypes;
+
+    // Allocate arrays
+    size_t total_entries = static_cast<size_t>(num_markers) * num_haplotypes;
+
+    index->prefix_.num_markers = num_markers;
+    index->prefix_.num_haplotypes = num_haplotypes;
+    index->prefix_.data.resize(total_entries);
+
+    index->divergence_.num_markers = num_markers;
+    index->divergence_.num_haplotypes = num_haplotypes;
+    index->divergence_.data.resize(total_entries);
+
+    // Read prefix array
+    file.read(reinterpret_cast<char*>(index->prefix_.data.data()),
+              total_entries * sizeof(haplotype_t));
+
+    // Read divergence array
+    file.read(reinterpret_cast<char*>(index->divergence_.data.data()),
+              total_entries * sizeof(marker_t));
+
+    LOG_INFO("Loaded PBWT index: " + std::to_string(num_markers) + " markers x " +
+             std::to_string(num_haplotypes) + " haplotypes");
+
+    return index;
+}
+
+// PBWT statistics computation
+PBWTStats compute_pbwt_stats(const PBWTIndex& index) {
+    PBWTStats stats;
+
+    if (index.num_markers() == 0 || index.num_haplotypes() == 0) {
+        return stats;
+    }
+
+    size_t total_entries = static_cast<size_t>(index.num_markers()) * index.num_haplotypes();
+    const auto& div_data = index.divergence().data;
+
+    // Compute sum and max
+    double sum = 0;
+    marker_t max_div = 0;
+
+    for (size_t i = 0; i < total_entries; ++i) {
+        sum += div_data[i];
+        if (div_data[i] > max_div) {
+            max_div = div_data[i];
+        }
+    }
+
+    stats.avg_divergence = sum / total_entries;
+    stats.max_divergence = max_div;
+
+    // Compute median (sample-based for efficiency)
+    std::vector<marker_t> sample;
+    size_t sample_size = std::min(total_entries, static_cast<size_t>(100000));
+    size_t step = total_entries / sample_size;
+
+    for (size_t i = 0; i < total_entries; i += step) {
+        sample.push_back(div_data[i]);
+    }
+
+    std::sort(sample.begin(), sample.end());
+    stats.median_divergence = sample[sample.size() / 2];
+
+    // Compression ratio estimate (vs raw storage)
+    size_t raw_size = static_cast<size_t>(index.num_markers()) * index.num_haplotypes();
+    size_t pbwt_size = index.memory_usage();
+    stats.compression_ratio = static_cast<double>(raw_size) / pbwt_size;
+
+    return stats;
+}
+
+bool validate_pbwt_index(
+    const PBWTIndex& index,
+    const allele_t* reference_panel
+) {
+    // Validate that PBWT prefix arrays are valid permutations
+    marker_t num_markers = index.num_markers();
+    haplotype_t num_haplotypes = index.num_haplotypes();
+
+    for (marker_t m = 0; m < std::min(num_markers, marker_t(100)); ++m) {  // Sample check
+        std::vector<bool> seen(num_haplotypes, false);
+
+        for (haplotype_t i = 0; i < num_haplotypes; ++i) {
+            haplotype_t hap = index.prefix().at(m, i);
+            if (hap >= num_haplotypes || seen[hap]) {
+                LOG_ERROR("Invalid PBWT: duplicate or out-of-range haplotype at marker " +
+                         std::to_string(m) + ", position " + std::to_string(i));
+                return false;
+            }
+            seen[hap] = true;
+        }
+    }
+
+    // Validate divergence values are within range
+    for (marker_t m = 0; m < std::min(num_markers, marker_t(100)); ++m) {
+        for (haplotype_t i = 0; i < num_haplotypes; ++i) {
+            marker_t div = index.divergence().at(m, i);
+            if (div > m + 1) {
+                LOG_ERROR("Invalid PBWT: divergence value " + std::to_string(div) +
+                         " exceeds marker index " + std::to_string(m));
+                return false;
+            }
+        }
+    }
+
+    LOG_INFO("PBWT index validation passed");
+    return true;
+}
+
 } // namespace pbwt
 } // namespace swiftimpute

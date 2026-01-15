@@ -1,4 +1,5 @@
 #include "api/imputer.hpp"
+#include "api/checkpoint.hpp"
 #include "core/types.hpp"
 #include "phasing/pre_phaser.hpp"
 #include "phasing/gpu_phaser.cuh"
@@ -6,10 +7,12 @@
 #include "analysis/qc_filter.hpp"
 #include "io/parallel_vcf_loader.hpp"
 #include "io/genetic_map.hpp"
+#include "io/binary_format.hpp"
 #include <iostream>
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <filesystem>
 
 using namespace swiftimpute;
 
@@ -54,6 +57,16 @@ struct CommandLineArgs {
     bool rebuild_pbwt = false;        // Rebuild PBWT per window
     uint32_t pbwt_chunk_size = 0;     // PBWT chunk size (0 = use window_size)
     uint32_t window_size = 0;         // Override window size (0 = use preset)
+
+    // Checkpoint and batch processing options
+    std::string checkpoint_file;      // Checkpoint file for resume support
+    std::string work_dir;             // Working directory for temp files
+    bool batch_mode = false;          // Enable batch chromosome-by-chromosome mode
+    bool resume = false;              // Resume from checkpoint
+    bool save_binary_ref = false;     // Save reference as binary for faster reload
+    std::string binary_ref_path;      // Path for binary reference panel
+    bool save_pbwt = false;           // Save PBWT index for reuse
+    std::string pbwt_path;            // Path for PBWT index file
 
     bool parse(int argc, char* argv[]) {
         for (int i = 1; i < argc; i++) {
@@ -117,6 +130,22 @@ struct CommandLineArgs {
                 if (++i < argc) pbwt_chunk_size = std::stoul(argv[i]);
             } else if (arg == "--window-size") {
                 if (++i < argc) window_size = std::stoul(argv[i]);
+            } else if (arg == "--checkpoint" || arg == "--ckpt") {
+                if (++i < argc) checkpoint_file = argv[i];
+            } else if (arg == "--work-dir" || arg == "--workdir") {
+                if (++i < argc) work_dir = argv[i];
+            } else if (arg == "--batch" || arg == "--batch-mode") {
+                batch_mode = true;
+            } else if (arg == "--resume") {
+                resume = true;
+            } else if (arg == "--save-binary-ref" || arg == "--save-ref") {
+                save_binary_ref = true;
+            } else if (arg == "--binary-ref") {
+                if (++i < argc) binary_ref_path = argv[i];
+            } else if (arg == "--save-pbwt") {
+                save_pbwt = true;
+            } else if (arg == "--pbwt-file" || arg == "--pbwt-path") {
+                if (++i < argc) pbwt_path = argv[i];
             } else if (arg == "--help" || arg == "-h") {
                 return false;
             }
@@ -181,6 +210,15 @@ struct CommandLineArgs {
         std::cout << "  --map-dir DIR           Directory with per-chromosome map files\n";
         std::cout << "  --map-format FORMAT     Map file format: auto, plink, hapmap, shapeit, beagle\n";
         std::cout << "                          [default: auto-detect]\n\n";
+        std::cout << "Checkpoint and batch processing:\n";
+        std::cout << "  --batch                 Enable batch mode (process chromosomes sequentially)\n";
+        std::cout << "  --checkpoint FILE       Checkpoint file for progress tracking\n";
+        std::cout << "  --resume                Resume from existing checkpoint\n";
+        std::cout << "  --work-dir DIR          Working directory for temporary files\n";
+        std::cout << "  --save-ref              Save reference as binary for faster reload\n";
+        std::cout << "  --binary-ref FILE       Path for binary reference panel\n";
+        std::cout << "  --save-pbwt             Save PBWT index for reuse\n";
+        std::cout << "  --pbwt-file FILE        Path for PBWT index file\n\n";
         std::cout << "Examples:\n";
         std::cout << "  # Basic imputation\n";
         std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz\n\n";
@@ -191,7 +229,13 @@ struct CommandLineArgs {
         std::cout << "  # Overlap analysis only (no imputation)\n";
         std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz --overlap\n\n";
         std::cout << "  # With genetic recombination map for improved accuracy\n";
-        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --map genetic_map.txt\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --map genetic_map.txt\n\n";
+        std::cout << "  # Batch mode with checkpointing (resume-safe)\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --batch --checkpoint progress.ckpt\n\n";
+        std::cout << "  # Resume interrupted batch imputation\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --resume --checkpoint progress.ckpt\n\n";
+        std::cout << "  # Save binary reference and PBWT for fast re-runs\n";
+        std::cout << "  " << program_name << " -r ref.vcf.gz -t targets.vcf.gz -o imputed.vcf.gz --save-ref --save-pbwt\n";
     }
 };
 
@@ -676,12 +720,101 @@ int main(int argc, char* argv[]) {
         LOG_INFO("  Total memory: " +
                  std::to_string(dev_info.total_memory / (1024*1024*1024)) + " GB");
 
+        // Save binary reference if requested
+        if (args.save_binary_ref || !args.binary_ref_path.empty()) {
+            std::string binary_path = args.binary_ref_path.empty() ?
+                args.reference_vcf + ".swref" : args.binary_ref_path;
+            LOG_INFO("Saving binary reference panel: " + binary_path);
+            io::write_reference_panel_binary(
+                binary_path,
+                reference->markers(),
+                reference->samples(),
+                reference->haplotypes(),
+                reference->num_haplotypes()
+            );
+        }
+
         // Get chromosomes in the data
         auto ref_chroms = reference->get_chromosomes();
         auto target_chroms = targets->get_chromosomes();
 
         LOG_INFO("Reference chromosomes: " + std::to_string(ref_chroms.size()));
         LOG_INFO("Target chromosomes: " + std::to_string(target_chroms.size()));
+
+        // ==== BATCH MODE WITH CHECKPOINTING ====
+        if (args.batch_mode || args.resume) {
+            LOG_INFO("");
+            LOG_INFO("========================================");
+            LOG_INFO("Running in BATCH MODE with checkpointing");
+            LOG_INFO("========================================");
+
+            // Setup checkpoint path
+            std::string checkpoint_path = args.checkpoint_file;
+            if (checkpoint_path.empty()) {
+                checkpoint_path = args.output_vcf + ".checkpoint";
+            }
+
+            // Setup work directory
+            std::string work_dir = args.work_dir;
+            if (work_dir.empty()) {
+                work_dir = std::filesystem::path(args.output_vcf).parent_path().string();
+                if (work_dir.empty()) work_dir = ".";
+                work_dir += "/swiftimpute_work";
+            }
+            std::filesystem::create_directories(work_dir);
+
+            LOG_INFO("Checkpoint file: " + checkpoint_path);
+            LOG_INFO("Work directory: " + work_dir);
+
+            // Create batch imputer with progress callback
+            BatchImputer batch_imputer(
+                args.reference_vcf,
+                args.target_vcf,
+                args.output_vcf,
+                config
+            );
+
+            batch_imputer.set_checkpoint_path(checkpoint_path);
+            batch_imputer.set_work_dir(work_dir);
+
+            // Progress callback
+            batch_imputer.set_progress_callback(
+                [](const std::string& chrom, uint32_t chrom_idx, uint32_t total_chroms,
+                   double chrom_progress, double overall_progress) {
+                    std::cout << "\r[Chr " << chrom << " " << (chrom_idx + 1) << "/" << total_chroms << "] "
+                              << std::fixed << std::setprecision(1)
+                              << (chrom_progress * 100) << "% | Overall: "
+                              << (overall_progress * 100) << "%      " << std::flush;
+                }
+            );
+
+            // Run batch imputation
+            auto batch_start = std::chrono::high_resolution_clock::now();
+            bool success = batch_imputer.run();
+            auto batch_end = std::chrono::high_resolution_clock::now();
+
+            std::cout << std::endl;
+
+            auto batch_duration = std::chrono::duration_cast<std::chrono::seconds>(
+                batch_end - batch_start
+            ).count();
+
+            LOG_INFO("");
+            LOG_INFO("========================================");
+            if (success) {
+                LOG_INFO("Batch imputation COMPLETED successfully");
+            } else {
+                LOG_WARNING("Batch imputation completed with some failures");
+            }
+            LOG_INFO("Total time: " + std::to_string(batch_duration / 60) + "m " +
+                     std::to_string(batch_duration % 60) + "s");
+            LOG_INFO("Output: " + args.output_vcf);
+            LOG_INFO("========================================");
+
+            LOG_INFO(batch_imputer.summary());
+
+            return success ? 0 : 1;
+        }
 
         // Determine processing mode
         bool multi_chrom_mode = false;
