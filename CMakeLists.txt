@@ -20,6 +20,7 @@ option(USE_FAST_MATH "Enable fast math optimizations" OFF)
 option(BUILD_TESTS "Build test suite" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(ENABLE_HTSLIB "Enable htslib for compressed VCF/BCF support" ON)
+option(BUILD_TUI "Build terminal user interface" ON)
 
 # CUDA architectures (user can override with -DCUDA_ARCHITECTURES)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -248,6 +249,45 @@ add_executable(swiftimpute
 target_link_libraries(swiftimpute
     swiftimpute_lib
 )
+
+# Terminal User Interface (TUI)
+if(BUILD_TUI)
+    include(FetchContent)
+
+    # Fetch FTXUI library
+    FetchContent_Declare(
+        ftxui
+        GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+        GIT_TAG v5.0.0
+    )
+    FetchContent_GetProperties(ftxui)
+    if(NOT ftxui_POPULATED)
+        FetchContent_Populate(ftxui)
+        add_subdirectory(${ftxui_SOURCE_DIR} ${ftxui_BINARY_DIR} EXCLUDE_FROM_ALL)
+    endif()
+
+    # TUI executable
+    add_executable(swiftimpute-ui
+        src/ui/tui_main.cpp
+    )
+
+    target_link_libraries(swiftimpute-ui
+        PRIVATE
+            swiftimpute_lib
+            ftxui::screen
+            ftxui::dom
+            ftxui::component
+    )
+
+    # Install TUI executable
+    install(TARGETS swiftimpute-ui
+        RUNTIME DESTINATION bin
+    )
+
+    message(STATUS "  TUI support: ENABLED")
+else()
+    message(STATUS "  TUI support: DISABLED")
+endif()
 
 # Tests (existing tests only)
 if(BUILD_TESTS)
