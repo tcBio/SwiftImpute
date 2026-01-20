@@ -629,11 +629,15 @@ void Imputer::initialize_gpu_kernels() {
 }
 
 void Imputer::allocate_batch_memory(uint32_t batch_size) {
+    LOG_INFO("[Alloc] allocate_batch_memory called with batch_size=" + std::to_string(batch_size));
+
     if (batch_size == current_batch_size_ && d_genotype_liks_ != nullptr) {
+        LOG_INFO("[Alloc] Memory already allocated for this batch size, skipping");
         return;  // Already allocated
     }
 
     // Free existing memory
+    LOG_INFO("[Alloc] Freeing existing batch memory...");
     free_batch_memory();
 
     marker_t num_markers = reference_.num_markers();
@@ -642,6 +646,12 @@ void Imputer::allocate_batch_memory(uint32_t batch_size) {
         config_.checkpoint_interval : static_cast<uint32_t>(std::sqrt(num_markers));
     uint32_t num_checkpoints = (num_markers + checkpoint_interval - 1) / checkpoint_interval;
 
+    LOG_INFO("[Alloc] Parameters: batch_size=" + std::to_string(batch_size) +
+             ", num_markers=" + std::to_string(num_markers) +
+             ", num_states=" + std::to_string(num_states) +
+             ", checkpoint_interval=" + std::to_string(checkpoint_interval) +
+             ", num_checkpoints=" + std::to_string(num_checkpoints));
+
     // Calculate sizes
     size_t gl_size = static_cast<size_t>(batch_size) * num_markers * sizeof(GenotypeLikelihoods);
     size_t states_size = static_cast<size_t>(batch_size) * num_markers * num_states * 2 * sizeof(haplotype_t);
@@ -649,40 +659,70 @@ void Imputer::allocate_batch_memory(uint32_t batch_size) {
     size_t checkpoint_size = static_cast<size_t>(batch_size) * num_checkpoints * num_states * sizeof(prob_t);
     size_t scaling_size = static_cast<size_t>(batch_size) * num_markers * sizeof(prob_t);
     size_t output_size = static_cast<size_t>(batch_size) * 2 * num_markers * sizeof(allele_t);
+    size_t total_device_bytes = gl_size + states_size + emission_size + emission_size +
+                                checkpoint_size + scaling_size + output_size;
 
-    // Allocate device memory
+    LOG_INFO("[Alloc] Buffer sizes:");
+    LOG_INFO("[Alloc]   genotype_liks: " + std::to_string(gl_size / 1024 / 1024) + " MB");
+    LOG_INFO("[Alloc]   selected_states: " + std::to_string(states_size / 1024 / 1024) + " MB");
+    LOG_INFO("[Alloc]   emission_probs: " + std::to_string(emission_size / 1024 / 1024) + " MB");
+    LOG_INFO("[Alloc]   posterior_probs: " + std::to_string(emission_size / 1024 / 1024) + " MB");
+    LOG_INFO("[Alloc]   forward_checkpoints: " + std::to_string(checkpoint_size / 1024 / 1024) + " MB");
+    LOG_INFO("[Alloc]   scaling_factors: " + std::to_string(scaling_size / 1024 / 1024) + " MB");
+    LOG_INFO("[Alloc]   output_haplotypes: " + std::to_string(output_size / 1024 / 1024) + " MB");
+    LOG_INFO("[Alloc]   TOTAL: " + std::to_string(total_device_bytes / 1024 / 1024) + " MB");
+
+    // Check available GPU memory
+    size_t free_mem, total_mem;
+    CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
+    LOG_INFO("[Alloc] GPU memory: " + std::to_string(free_mem / 1024 / 1024) + " MB free / " +
+             std::to_string(total_mem / 1024 / 1024) + " MB total");
+
+    if (total_device_bytes > free_mem) {
+        LOG_ERROR("[Alloc] INSUFFICIENT GPU MEMORY! Need " + std::to_string(total_device_bytes / 1024 / 1024) +
+                  " MB but only " + std::to_string(free_mem / 1024 / 1024) + " MB available");
+        throw ImputationError("Insufficient GPU memory for batch allocation");
+    }
+
+    // Allocate device memory with individual error checking
+    LOG_INFO("[Alloc] Allocating d_genotype_liks_...");
     CHECK_CUDA(cudaMalloc(&d_genotype_liks_, gl_size));
+
+    LOG_INFO("[Alloc] Allocating d_selected_states_...");
     CHECK_CUDA(cudaMalloc(&d_selected_states_, states_size));
+
+    LOG_INFO("[Alloc] Allocating d_emission_probs_...");
     CHECK_CUDA(cudaMalloc(&d_emission_probs_, emission_size));
+
+    LOG_INFO("[Alloc] Allocating d_posterior_probs_...");
     CHECK_CUDA(cudaMalloc(&d_posterior_probs_, emission_size));
+
+    LOG_INFO("[Alloc] Allocating d_forward_checkpoints_...");
     CHECK_CUDA(cudaMalloc(&d_forward_checkpoints_, checkpoint_size));
+
+    LOG_INFO("[Alloc] Allocating d_scaling_factors_...");
     CHECK_CUDA(cudaMalloc(&d_scaling_factors_, scaling_size));
+
+    LOG_INFO("[Alloc] Allocating d_output_haplotypes_...");
     CHECK_CUDA(cudaMalloc(&d_output_haplotypes_, output_size));
+
+    LOG_INFO("[Alloc] All device memory allocated successfully");
 
     // Allocate pinned host memory for async transfers (if enabled)
     if (using_pinned_memory_) {
+        LOG_INFO("[Alloc] Allocating pinned host memory...");
         CHECK_CUDA(cudaMallocHost(&h_pinned_genotype_liks_, gl_size));
         CHECK_CUDA(cudaMallocHost(&h_pinned_selected_states_, states_size));
         CHECK_CUDA(cudaMallocHost(&h_pinned_output_haplotypes_, output_size));
-
-        LOG_INFO("Allocated pinned host memory for async transfers");
+        LOG_INFO("[Alloc] Pinned host memory allocated");
     }
 
     current_batch_size_ = batch_size;
 
-    double device_mb = (gl_size + states_size + emission_size + emission_size +
-                       checkpoint_size + scaling_size + output_size) / 1024.0 / 1024.0;
-    double total_mb = device_mb;
-
-    if (using_pinned_memory_) {
-        double pinned_mb = (gl_size + states_size + output_size) / 1024.0 / 1024.0;
-        total_mb += pinned_mb;
-        LOG_INFO("Allocated GPU memory: " + std::to_string(device_mb) + " MB device + " +
-                 std::to_string(pinned_mb) + " MB pinned host");
-    } else {
-        LOG_INFO("Allocated GPU memory for batch size " + std::to_string(batch_size) +
-                 " (" + std::to_string(total_mb) + " MB)");
-    }
+    // Log final memory state
+    CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
+    LOG_INFO("[Alloc] GPU memory after allocation: " + std::to_string(free_mem / 1024 / 1024) + " MB free");
+    LOG_INFO("[Alloc] Batch memory allocation complete");
 }
 
 void Imputer::free_batch_memory() {
@@ -704,27 +744,55 @@ void Imputer::free_batch_memory() {
 }
 
 void Imputer::build_index() {
-    LOG_INFO("Building PBWT index...");
+    LOG_INFO("[Index] ========================================");
+    LOG_INFO("[Index] Building PBWT index...");
+    LOG_INFO("[Index] Reference: " + std::to_string(reference_.num_markers()) + " markers, " +
+             std::to_string(reference_.num_haplotypes()) + " haplotypes");
+
+    // Estimate memory requirement
+    size_t estimated_size = static_cast<size_t>(reference_.num_markers()) *
+                            reference_.num_haplotypes() * (sizeof(haplotype_t) + sizeof(marker_t));
+    LOG_INFO("[Index] Estimated PBWT memory: " + std::to_string(estimated_size / 1024 / 1024) + " MB");
 
     // Build PBWT index from reference panel
+    LOG_INFO("[Index] Starting PBWT construction...");
     pbwt_index_ = pbwt::PBWTIndex::build(
         reference_.haplotypes(),
         reference_.num_markers(),
         reference_.num_haplotypes()
     );
+    LOG_INFO("[Index] PBWT index constructed successfully");
 
-    // Create GPU state selector (will throw if not implemented)
+    // Log GPU memory before creating selector
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    LOG_INFO("[Index] GPU memory before selector: " + std::to_string(free_mem / 1024 / 1024) + " MB free");
+
+    // Create GPU state selector
+    LOG_INFO("[Index] Creating GPUStateSelector with L=" + std::to_string(config_.hmm_params.num_states) +
+             ", device=" + std::to_string(device_id_));
     try {
         state_selector_ = std::make_unique<pbwt::GPUStateSelector>(
             *pbwt_index_,
             config_.hmm_params.num_states,
             device_id_
         );
+        LOG_INFO("[Index] GPUStateSelector created successfully");
+        LOG_INFO("[Index] GPU selector memory usage: " +
+                 std::to_string(state_selector_->device_memory_usage() / 1024 / 1024) + " MB");
     } catch (const ImputationError& e) {
-        LOG_WARNING("GPU state selector not available: " + std::string(e.what()));
+        LOG_WARNING("[Index] GPU state selector not available: " + std::string(e.what()));
+        LOG_WARNING("[Index] Will fall back to CPU state selection");
+    } catch (const std::exception& e) {
+        LOG_ERROR("[Index] Unexpected error creating GPU state selector: " + std::string(e.what()));
+        LOG_WARNING("[Index] Will fall back to CPU state selection");
     }
 
-    LOG_INFO("PBWT index built with " + std::to_string(pbwt_index_->memory_usage() / 1024 / 1024) + " MB");
+    // Log final GPU memory state
+    cudaMemGetInfo(&free_mem, &total_mem);
+    LOG_INFO("[Index] GPU memory after index build: " + std::to_string(free_mem / 1024 / 1024) + " MB free");
+    LOG_INFO("[Index] PBWT index built with " + std::to_string(pbwt_index_->memory_usage() / 1024 / 1024) + " MB");
+    LOG_INFO("[Index] ========================================");
 }
 
 void Imputer::validate_targets(const TargetData& targets) {
@@ -794,32 +862,51 @@ void Imputer::impute_batch(
     marker_t num_markers = targets.num_markers();
     uint32_t num_states = config_.hmm_params.num_states;
 
-    LOG_INFO("Processing batch: samples " + std::to_string(start_sample) + " to " + std::to_string(end_sample));
+    LOG_INFO("========================================");
+    LOG_INFO("[Batch] Processing samples " + std::to_string(start_sample) + " to " + std::to_string(end_sample));
+    LOG_INFO("[Batch] batch_size=" + std::to_string(batch_size) +
+             ", num_markers=" + std::to_string(num_markers) +
+             ", num_states=" + std::to_string(num_states));
+    LOG_INFO("[Batch] Reference haplotypes: " + std::to_string(reference_.num_haplotypes()));
+
+    // Log GPU memory status
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    LOG_INFO("[Batch] GPU memory: " + std::to_string(free_mem / 1024 / 1024) + " MB free / " +
+             std::to_string(total_mem / 1024 / 1024) + " MB total");
 
     // Lazy initialization of GPU kernels
     if (!gpu_kernels_initialized_) {
+        LOG_INFO("[Batch] Initializing GPU kernels (first batch)...");
         initialize_gpu_kernels();
     }
 
     // Allocate/reallocate batch memory if needed
     if (batch_size != current_batch_size_) {
+        LOG_INFO("[Batch] Reallocating batch memory for new batch size...");
         free_batch_memory();
         allocate_batch_memory(batch_size);
     }
 
     // Copy genotype likelihoods from TargetData to GPU
+    LOG_INFO("[Batch] Copying genotype likelihoods to GPU...");
     const GenotypeLikelihoods* host_liks = targets.genotype_likelihoods();
     size_t offset = static_cast<size_t>(start_sample) * num_markers;
+    size_t gl_bytes = batch_size * num_markers * sizeof(GenotypeLikelihoods);
+    LOG_INFO("[Batch] GL transfer size: " + std::to_string(gl_bytes / 1024 / 1024) + " MB");
 
     CHECK_CUDA(cudaMemcpy(
         d_genotype_liks_,
         host_liks + offset,
-        batch_size * num_markers * sizeof(GenotypeLikelihoods),
+        gl_bytes,
         cudaMemcpyHostToDevice
     ));
+    LOG_INFO("[Batch] Genotype likelihoods copied successfully");
 
     // Step 1: PBWT state selection
-    LOG_INFO("Running PBWT state selection for " + std::to_string(batch_size) + " samples");
+    LOG_INFO("[Step 1] PBWT state selection for " + std::to_string(batch_size) + " samples");
+    LOG_INFO("[Step 1] state_selector_=" + std::string(state_selector_ ? "valid" : "null") +
+             ", use_pbwt_selection=" + std::string(config_.hmm_params.use_pbwt_selection ? "true" : "false"));
 
     // Try GPU state selection first (much faster for large datasets)
     bool used_gpu_selection = false;
@@ -828,18 +915,31 @@ void Imputer::impute_batch(
         try {
             // Ensure PBWT index is on GPU
             if (!state_selector_->is_index_on_device()) {
-                LOG_INFO("Transferring PBWT index to GPU...");
+                LOG_INFO("[Step 1] PBWT index not on GPU, transferring...");
                 state_selector_->transfer_index_to_device();
+                LOG_INFO("[Step 1] PBWT index transfer complete");
+            } else {
+                LOG_INFO("[Step 1] PBWT index already on GPU");
             }
 
-            LOG_INFO("Using GPU-accelerated state selection");
+            LOG_INFO("[Step 1] Using GPU-accelerated state selection");
 
             // Allocate temporary buffer for GPU output (single haplotype per state)
             haplotype_t* d_temp_states = nullptr;
             size_t temp_size = static_cast<size_t>(batch_size) * num_markers * num_states;
-            CHECK_CUDA(cudaMalloc(&d_temp_states, temp_size * sizeof(haplotype_t)));
+            size_t temp_bytes = temp_size * sizeof(haplotype_t);
+            LOG_INFO("[Step 1] Allocating temp buffer: " + std::to_string(temp_bytes / 1024 / 1024) + " MB (" +
+                     std::to_string(temp_size) + " elements)");
+
+            cudaError_t alloc_err = cudaMalloc(&d_temp_states, temp_bytes);
+            if (alloc_err != cudaSuccess) {
+                LOG_ERROR("[Step 1] Failed to allocate temp buffer: " + std::string(cudaGetErrorString(alloc_err)));
+                throw CUDAError("Failed to allocate temp states buffer", static_cast<int>(alloc_err));
+            }
+            LOG_INFO("[Step 1] Temp buffer allocated at " + std::to_string(reinterpret_cast<uintptr_t>(d_temp_states)));
 
             // Run GPU state selection
+            LOG_INFO("[Step 1] Calling select_on_device...");
             state_selector_->select_on_device(
                 nullptr,  // No target haplotypes needed for PBWT-based selection
                 batch_size,
@@ -847,17 +947,20 @@ void Imputer::impute_batch(
                 reinterpret_cast<marker_t*>(d_temp_states),
                 stream_
             );
+            LOG_INFO("[Step 1] select_on_device returned");
 
             // Expand single haplotypes to pairs in d_selected_states_
-            // For now, do this on CPU (can be optimized to a simple kernel later)
+            LOG_INFO("[Step 1] Copying results back to host for expansion...");
             std::vector<haplotype_t> h_temp_states(temp_size);
             CHECK_CUDA(cudaMemcpy(
                 h_temp_states.data(),
                 d_temp_states,
-                temp_size * sizeof(haplotype_t),
+                temp_bytes,
                 cudaMemcpyDeviceToHost
             ));
+            LOG_INFO("[Step 1] Results copied to host");
 
+            LOG_INFO("[Step 1] Expanding haplotype pairs on CPU...");
             std::vector<haplotype_t> h_selected_states(batch_size * num_markers * num_states * 2);
 
             for (uint32_t batch_s = 0; batch_s < batch_size; ++batch_s) {
@@ -871,23 +974,36 @@ void Imputer::impute_batch(
                         h_selected_states[dst_base + k * 2 + 1] = (hap_idx + 1) % reference_.num_haplotypes();
                     }
                 }
+
+                // Progress logging every 10 samples
+                if ((batch_s + 1) % 10 == 0) {
+                    LOG_INFO("[Step 1] Expanded " + std::to_string(batch_s + 1) + "/" + std::to_string(batch_size) + " samples");
+                }
             }
+            LOG_INFO("[Step 1] Haplotype pair expansion complete");
 
             // Copy to GPU
+            size_t final_bytes = batch_size * num_markers * num_states * 2 * sizeof(haplotype_t);
+            LOG_INFO("[Step 1] Copying expanded states to GPU: " + std::to_string(final_bytes / 1024 / 1024) + " MB");
             CHECK_CUDA(cudaMemcpy(
                 d_selected_states_,
                 h_selected_states.data(),
-                batch_size * num_markers * num_states * 2 * sizeof(haplotype_t),
+                final_bytes,
                 cudaMemcpyHostToDevice
             ));
+            LOG_INFO("[Step 1] States copied to GPU");
 
+            LOG_INFO("[Step 1] Freeing temp buffer...");
             cudaFree(d_temp_states);
             used_gpu_selection = true;
 
-            LOG_INFO("GPU state selection complete");
+            LOG_INFO("[Step 1] GPU state selection complete");
         } catch (const std::exception& e) {
-            LOG_WARNING("GPU state selection failed, falling back to CPU: " + std::string(e.what()));
+            LOG_WARNING("[Step 1] GPU state selection failed: " + std::string(e.what()));
+            LOG_WARNING("[Step 1] Falling back to CPU state selection");
         }
+    } else {
+        LOG_INFO("[Step 1] GPU state selection not available, using CPU");
     }
 
     // Fall back to CPU state selection if GPU not available or failed

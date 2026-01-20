@@ -408,13 +408,42 @@ void launch_select_states(
     haplotype_t* d_selected_states,
     cudaStream_t stream
 ) {
-    // Choose kernel based on L value and problem size
+    LOG_INFO("[GPU State Selection] Starting kernel launch");
+    LOG_INFO("[GPU State Selection] Parameters: samples=" + std::to_string(num_samples) +
+             ", markers=" + std::to_string(num_markers) +
+             ", haplotypes=" + std::to_string(num_haplotypes) +
+             ", L=" + std::to_string(num_states_L));
 
+    // Validate pointers
+    if (!d_prefix) {
+        throw ImputationError("[GPU State Selection] d_prefix is null");
+    }
+    if (!d_divergence) {
+        throw ImputationError("[GPU State Selection] d_divergence is null");
+    }
+    if (!d_selected_states) {
+        throw ImputationError("[GPU State Selection] d_selected_states is null");
+    }
+
+    // Log memory addresses for debugging
+    LOG_DEBUG("[GPU State Selection] d_prefix=" + std::to_string(reinterpret_cast<uintptr_t>(d_prefix)));
+    LOG_DEBUG("[GPU State Selection] d_divergence=" + std::to_string(reinterpret_cast<uintptr_t>(d_divergence)));
+    LOG_DEBUG("[GPU State Selection] d_selected_states=" + std::to_string(reinterpret_cast<uintptr_t>(d_selected_states)));
+
+    // Calculate output size for logging
+    size_t output_size = static_cast<size_t>(num_samples) * num_markers * num_states_L;
+    LOG_INFO("[GPU State Selection] Output buffer size: " + std::to_string(output_size * sizeof(haplotype_t) / 1024 / 1024) + " MB");
+
+    // Choose kernel based on L value and problem size
     if (num_states_L <= 32 && num_haplotypes <= 10000) {
         // Use warp-based kernel for small L
         uint32_t total_pairs = num_markers * num_samples;
         uint32_t warps_per_block = THREADS_PER_BLOCK / WARP_SIZE;
         uint32_t num_blocks = (total_pairs + warps_per_block - 1) / warps_per_block;
+
+        LOG_INFO("[GPU State Selection] Using WARP kernel: blocks=" + std::to_string(num_blocks) +
+                 ", threads_per_block=" + std::to_string(THREADS_PER_BLOCK) +
+                 ", total_pairs=" + std::to_string(total_pairs));
 
         select_states_warp_kernel<<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
             d_prefix,
@@ -430,6 +459,10 @@ void launch_select_states(
         dim3 grid(num_samples, (num_markers + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         dim3 block(THREADS_PER_BLOCK);
 
+        LOG_INFO("[GPU State Selection] Using BITONIC kernel: grid=(" +
+                 std::to_string(grid.x) + "," + std::to_string(grid.y) + "), block=" +
+                 std::to_string(block.x));
+
         select_states_bitonic_kernel<<<grid, block, 0, stream>>>(
             d_prefix,
             d_divergence,
@@ -444,6 +477,21 @@ void launch_select_states(
         dim3 block(THREADS_PER_BLOCK);
         size_t shared_mem = THREADS_PER_BLOCK * num_states_L * sizeof(DivergenceHaplotypePair);
 
+        LOG_INFO("[GPU State Selection] Using BLOCK kernel: grid=(" +
+                 std::to_string(grid.x) + "," + std::to_string(grid.y) + "), block=" +
+                 std::to_string(block.x) + ", shared_mem=" + std::to_string(shared_mem) + " bytes");
+
+        // Check shared memory limits
+        int device;
+        cudaGetDevice(&device);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, device);
+        if (shared_mem > prop.sharedMemPerBlock) {
+            LOG_ERROR("[GPU State Selection] Shared memory request (" + std::to_string(shared_mem) +
+                      ") exceeds device limit (" + std::to_string(prop.sharedMemPerBlock) + ")");
+            throw ImputationError("Shared memory request exceeds device limit");
+        }
+
         select_states_kernel<<<grid, block, shared_mem, stream>>>(
             d_prefix,
             d_divergence,
@@ -455,11 +503,23 @@ void launch_select_states(
         );
     }
 
-    // Check for errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw CUDAError("launch_select_states failed", static_cast<int>(err));
+    // Check for launch errors
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        LOG_ERROR("[GPU State Selection] Kernel launch failed: " + std::string(cudaGetErrorString(launch_err)));
+        throw CUDAError("launch_select_states kernel launch failed", static_cast<int>(launch_err));
     }
+
+    LOG_INFO("[GPU State Selection] Kernel launched successfully, waiting for completion...");
+
+    // Synchronize to catch execution errors
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    if (sync_err != cudaSuccess) {
+        LOG_ERROR("[GPU State Selection] Kernel execution failed: " + std::string(cudaGetErrorString(sync_err)));
+        throw CUDAError("launch_select_states kernel execution failed", static_cast<int>(sync_err));
+    }
+
+    LOG_INFO("[GPU State Selection] Kernel completed successfully");
 }
 
 // ============================================================================
@@ -475,13 +535,46 @@ void gpu_state_selector_allocate(
     haplotype_t** d_prefix,
     marker_t** d_divergence
 ) {
+    LOG_INFO("[GPU Alloc] Setting device to " + std::to_string(device_id));
     CHECK_CUDA(cudaSetDevice(device_id));
+
+    // Query available memory before allocation
+    size_t free_mem, total_mem;
+    CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
+    LOG_INFO("[GPU Alloc] GPU memory: " + std::to_string(free_mem / 1024 / 1024) + " MB free / " +
+             std::to_string(total_mem / 1024 / 1024) + " MB total");
 
     size_t prefix_size = static_cast<size_t>(index.num_markers()) * index.num_haplotypes();
     size_t divergence_size = prefix_size;
 
-    CHECK_CUDA(cudaMalloc(d_prefix, prefix_size * sizeof(haplotype_t)));
-    CHECK_CUDA(cudaMalloc(d_divergence, divergence_size * sizeof(marker_t)));
+    size_t prefix_bytes = prefix_size * sizeof(haplotype_t);
+    size_t divergence_bytes = divergence_size * sizeof(marker_t);
+    size_t total_bytes = prefix_bytes + divergence_bytes;
+
+    LOG_INFO("[GPU Alloc] Allocating PBWT arrays: " +
+             std::to_string(index.num_markers()) + " markers x " +
+             std::to_string(index.num_haplotypes()) + " haplotypes");
+    LOG_INFO("[GPU Alloc] Prefix array: " + std::to_string(prefix_bytes / 1024 / 1024) + " MB");
+    LOG_INFO("[GPU Alloc] Divergence array: " + std::to_string(divergence_bytes / 1024 / 1024) + " MB");
+    LOG_INFO("[GPU Alloc] Total allocation: " + std::to_string(total_bytes / 1024 / 1024) + " MB");
+
+    if (total_bytes > free_mem) {
+        LOG_ERROR("[GPU Alloc] Insufficient GPU memory! Need " + std::to_string(total_bytes / 1024 / 1024) +
+                  " MB but only " + std::to_string(free_mem / 1024 / 1024) + " MB available");
+        throw ImputationError("Insufficient GPU memory for PBWT index");
+    }
+
+    LOG_INFO("[GPU Alloc] Allocating prefix array...");
+    CHECK_CUDA(cudaMalloc(d_prefix, prefix_bytes));
+    LOG_INFO("[GPU Alloc] Prefix array allocated at " + std::to_string(reinterpret_cast<uintptr_t>(*d_prefix)));
+
+    LOG_INFO("[GPU Alloc] Allocating divergence array...");
+    CHECK_CUDA(cudaMalloc(d_divergence, divergence_bytes));
+    LOG_INFO("[GPU Alloc] Divergence array allocated at " + std::to_string(reinterpret_cast<uintptr_t>(*d_divergence)));
+
+    // Query memory after allocation
+    CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
+    LOG_INFO("[GPU Alloc] GPU memory after allocation: " + std::to_string(free_mem / 1024 / 1024) + " MB free");
 }
 
 void gpu_state_selector_transfer(
@@ -490,26 +583,45 @@ void gpu_state_selector_transfer(
     marker_t* d_divergence,
     cudaStream_t stream
 ) {
+    LOG_INFO("[GPU Transfer] Starting PBWT index transfer to GPU");
+
     size_t prefix_size = static_cast<size_t>(index.num_markers()) * index.num_haplotypes();
     size_t divergence_size = prefix_size;
+
+    size_t prefix_bytes = prefix_size * sizeof(haplotype_t);
+    size_t divergence_bytes = divergence_size * sizeof(marker_t);
+
+    LOG_INFO("[GPU Transfer] Transferring prefix array: " + std::to_string(prefix_bytes / 1024 / 1024) + " MB");
+    LOG_INFO("[GPU Transfer] Host source: " + std::to_string(reinterpret_cast<uintptr_t>(index.prefix().data.data())));
+    LOG_INFO("[GPU Transfer] Device dest: " + std::to_string(reinterpret_cast<uintptr_t>(d_prefix)));
 
     CHECK_CUDA(cudaMemcpyAsync(
         d_prefix,
         index.prefix().data.data(),
-        prefix_size * sizeof(haplotype_t),
+        prefix_bytes,
         cudaMemcpyHostToDevice,
         stream
     ));
+
+    LOG_INFO("[GPU Transfer] Prefix array transfer initiated");
+
+    LOG_INFO("[GPU Transfer] Transferring divergence array: " + std::to_string(divergence_bytes / 1024 / 1024) + " MB");
+    LOG_INFO("[GPU Transfer] Host source: " + std::to_string(reinterpret_cast<uintptr_t>(index.divergence().data.data())));
+    LOG_INFO("[GPU Transfer] Device dest: " + std::to_string(reinterpret_cast<uintptr_t>(d_divergence)));
 
     CHECK_CUDA(cudaMemcpyAsync(
         d_divergence,
         index.divergence().data.data(),
-        divergence_size * sizeof(marker_t),
+        divergence_bytes,
         cudaMemcpyHostToDevice,
         stream
     ));
 
+    LOG_INFO("[GPU Transfer] Divergence array transfer initiated, synchronizing...");
+
     CHECK_CUDA(cudaStreamSynchronize(stream));
+
+    LOG_INFO("[GPU Transfer] PBWT index transfer complete");
 }
 
 void gpu_state_selector_free(
